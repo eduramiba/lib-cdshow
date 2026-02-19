@@ -22,6 +22,7 @@
 #include <map>
 #include <set>
 #include <algorithm>
+#include <limits>
 
 #ifndef SAFE_RELEASE
 #define SAFE_RELEASE(x) do { if ((x) != nullptr) { (x)->Release(); (x) = nullptr; } } while(0)
@@ -152,9 +153,9 @@ static std::string WStringToUtf8(const std::wstring& ws)
         return std::string();
 
     std::string result;
-    result.resize(sizeNeeded - 1);  // exclude null terminator
+    result.resize((size_t)sizeNeeded);  // include null terminator
 
-    WideCharToMultiByte(
+    int written = WideCharToMultiByte(
         CP_UTF8,
         0,
         ws.c_str(),
@@ -163,6 +164,12 @@ static std::string WStringToUtf8(const std::wstring& ws)
         sizeNeeded,
         nullptr,
         nullptr);
+    if (written <= 0)
+        return std::string();
+    if (!result.empty() && result.back() == '\0')
+        result.pop_back();
+    else if ((size_t)written < result.size())
+        result.resize((size_t)written);
 
     return result;
 }
@@ -172,8 +179,11 @@ static std::string WToUtf8(const std::wstring& ws) {
     int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
     if (sizeNeeded <= 0) return {};
     std::string out;
-    out.resize((size_t)sizeNeeded - 1);
-    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, &out[0], sizeNeeded, nullptr, nullptr);
+    out.resize((size_t)sizeNeeded);
+    int written = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, &out[0], sizeNeeded, nullptr, nullptr);
+    if (written <= 0) return {};
+    if (!out.empty() && out.back() == '\0') out.pop_back();
+    else if ((size_t)written < out.size()) out.resize((size_t)written);
     return out;
 }
 
@@ -385,6 +395,7 @@ struct DsDevice {
 
 struct DsSession;
 static uint64_t now_ts100ns_utc();
+static bool calc_frame_layout_bytes(uint32_t width, uint32_t height, size_t& rowBytes, size_t& totalBytes);
 
 class FrameGrabberCB : public ISampleGrabberCB {
 public:
@@ -521,8 +532,9 @@ HRESULT STDMETHODCALLTYPE StillButtonCB::SampleCB(double sampleTime, IMediaSampl
 HRESULT STDMETHODCALLTYPE FrameGrabberCB::BufferCB(double, BYTE* buffer, long len) {
     if (!_s || !buffer || len <= 0) return S_OK;
 
-    const size_t rowBytes = (size_t)_s->width * 4;
-    const size_t expected = rowBytes * (size_t)_s->height;
+    size_t rowBytes = 0;
+    size_t expected = 0;
+    if (!calc_frame_layout_bytes(_s->width, _s->height, rowBytes, expected)) return S_OK;
     if (expected == 0 || (size_t)len < expected) return S_OK;
 
     std::lock_guard<std::mutex> lk(_s->frameMutex);
@@ -547,8 +559,29 @@ HRESULT STDMETHODCALLTYPE FrameGrabberCB::BufferCB(double, BYTE* buffer, long le
 // ---- Global capture state ----
 static std::mutex g_dsMutex;
 static bool g_dsInitialized = false;
+static uint64_t g_dsGeneration = 1;
 static std::vector<DsDevice> g_dsDevices;
 static std::map<uint32_t, DsSession*> g_dsSessions;
+
+static bool try_get_vih_dimensions(const VIDEOINFOHEADER* vih, uint32_t& width, uint32_t& height) {
+    if (!vih) return false;
+    LONG w = vih->bmiHeader.biWidth;
+    LONG h = vih->bmiHeader.biHeight;
+    if (w <= 0 || h == 0 || h == std::numeric_limits<LONG>::min()) return false;
+
+    width = (uint32_t)w;
+    height = (uint32_t)(h < 0 ? -h : h);
+    return true;
+}
+
+static bool calc_frame_layout_bytes(uint32_t width, uint32_t height, size_t& rowBytes, size_t& totalBytes) {
+    if (width == 0 || height == 0) return false;
+    if ((size_t)width > (SIZE_MAX / 4)) return false;
+    rowBytes = (size_t)width * 4;
+    if ((size_t)height > (SIZE_MAX / rowBytes)) return false;
+    totalBytes = rowBytes * (size_t)height;
+    return true;
+}
 
 // ---- Rebind by moniker display name ----
 static HRESULT bind_moniker_by_display_name(const std::wstring& displayName, IMoniker** outMk) {
@@ -585,6 +618,8 @@ static uint64_t now_ts100ns_utc() {
 
 // ---- Enumerate devices + formats (dedup with correct mapping) ----
 static HRESULT enumerate_devices_and_formats() {
+    constexpr int kMaxStreamCapsBytes = 1024 * 1024;
+
     g_dsDevices.clear();
 
     ICreateDevEnum* devEnum = nullptr;
@@ -642,10 +677,14 @@ static HRESULT enumerate_devices_and_formats() {
             IGraphBuilder* graph = nullptr;
             ICaptureGraphBuilder2* cap = nullptr;
 
-            if (SUCCEEDED(CoCreateInstance(CLSID_FilterGraph, nullptr, CLSCTX_INPROC_SERVER,
-                IID_IGraphBuilder, (void**)&graph)) &&
-                SUCCEEDED(CoCreateInstance(CLSID_CaptureGraphBuilder2, nullptr, CLSCTX_INPROC_SERVER,
-                    IID_ICaptureGraphBuilder2, (void**)&cap))) {
+            HRESULT hrGraph = CoCreateInstance(CLSID_FilterGraph, nullptr, CLSCTX_INPROC_SERVER,
+                IID_IGraphBuilder, (void**)&graph);
+            HRESULT hrCap = SUCCEEDED(hrGraph)
+                ? CoCreateInstance(CLSID_CaptureGraphBuilder2, nullptr, CLSCTX_INPROC_SERVER,
+                    IID_ICaptureGraphBuilder2, (void**)&cap)
+                : hrGraph;
+
+            if (SUCCEEDED(hrGraph) && SUCCEEDED(hrCap)) {
 
                 HRESULT hrFG = cap->SetFiltergraph(graph);
                 if (SUCCEEDED(hrFG)) {
@@ -664,47 +703,57 @@ static HRESULT enumerate_devices_and_formats() {
 
                 if (SUCCEEDED(hrCfg) && cfg) {
                     int count = 0, size = 0;
-                    cfg->GetNumberOfCapabilities(&count, &size);
+                    HRESULT hrCaps = cfg->GetNumberOfCapabilities(&count, &size);
+                    if (SUCCEEDED(hrCaps) &&
+                        count > 0 &&
+                        size >= (int)sizeof(VIDEO_STREAM_CONFIG_CAPS) &&
+                        size <= kMaxStreamCapsBytes) {
+                        std::vector<uint8_t> capsBuf((size_t)size);
 
-                    std::vector<uint8_t> capsBuf((size_t)size);
+                        for (int i = 0; i < count; ++i) {
+                            AM_MEDIA_TYPE* mt = nullptr;
+                            if (SUCCEEDED(cfg->GetStreamCaps(i, &mt, capsBuf.data())) && mt) {
+                                VIDEO_STREAM_CONFIG_CAPS* caps = (VIDEO_STREAM_CONFIG_CAPS*)capsBuf.data();
 
-                    for (int i = 0; i < count; ++i) {
-                        AM_MEDIA_TYPE* mt = nullptr;
-                        if (SUCCEEDED(cfg->GetStreamCaps(i, &mt, capsBuf.data())) && mt) {
-                            VIDEO_STREAM_CONFIG_CAPS* caps = (VIDEO_STREAM_CONFIG_CAPS*)capsBuf.data();
-
-                            uint32_t w = 0, h = 0;
-                            if (mt->formattype == FORMAT_VideoInfo && mt->pbFormat && mt->cbFormat >= sizeof(VIDEOINFOHEADER)) {
-                                auto vih = (VIDEOINFOHEADER*)mt->pbFormat;
-                                w = (uint32_t)vih->bmiHeader.biWidth;
-                                h = (uint32_t)abs(vih->bmiHeader.biHeight);
-                            }
-
-                            uint32_t maxFps = 0;
-                            if (caps->MinFrameInterval > 0) {
-                                maxFps = (uint32_t)(10000000ULL / (uint64_t)caps->MinFrameInterval);
-                            }
-                            else if (mt->formattype == FORMAT_VideoInfo && mt->pbFormat && mt->cbFormat >= sizeof(VIDEOINFOHEADER)) {
-                                auto vih = (VIDEOINFOHEADER*)mt->pbFormat;
-                                if (vih->AvgTimePerFrame > 0)
-                                    maxFps = (uint32_t)(10000000ULL / (uint64_t)vih->AvgTimePerFrame);
-                            }
-
-                            if (w && h) {
-                                FormatKey key{ w, h, maxFps, mt->subtype };
-                                if (uniq.find(key) == uniq.end()) {
-                                    DsFormat f{};
-                                    f.width = w;
-                                    f.height = h;
-                                    f.maxFps = maxFps;
-                                    f.subtype = mt->subtype;
-                                    f.streamCapsIndex = (uint32_t)i; // REAL index
-                                    uniq.emplace(key, f);
+                                uint32_t w = 0, h = 0;
+                                if (mt->formattype == FORMAT_VideoInfo && mt->pbFormat && mt->cbFormat >= sizeof(VIDEOINFOHEADER)) {
+                                    auto vih = (VIDEOINFOHEADER*)mt->pbFormat;
+                                    if (!try_get_vih_dimensions(vih, w, h)) {
+                                        free_am_media_type(mt);
+                                        continue;
+                                    }
                                 }
-                            }
 
-                            free_am_media_type(mt);
+                                uint32_t maxFps = 0;
+                                if (caps->MinFrameInterval > 0) {
+                                    maxFps = (uint32_t)(10000000ULL / (uint64_t)caps->MinFrameInterval);
+                                }
+                                else if (mt->formattype == FORMAT_VideoInfo && mt->pbFormat && mt->cbFormat >= sizeof(VIDEOINFOHEADER)) {
+                                    auto vih = (VIDEOINFOHEADER*)mt->pbFormat;
+                                    if (vih->AvgTimePerFrame > 0)
+                                        maxFps = (uint32_t)(10000000ULL / (uint64_t)vih->AvgTimePerFrame);
+                                }
+
+                                if (w && h) {
+                                    FormatKey key{ w, h, maxFps, mt->subtype };
+                                    if (uniq.find(key) == uniq.end()) {
+                                        DsFormat f{};
+                                        f.width = w;
+                                        f.height = h;
+                                        f.maxFps = maxFps;
+                                        f.subtype = mt->subtype;
+                                        f.streamCapsIndex = (uint32_t)i; // REAL index
+                                        uniq.emplace(key, f);
+                                    }
+                                }
+
+                                free_am_media_type(mt);
+                            }
                         }
+                    }
+                    else {
+                        dbg_printf("Invalid stream capabilities: hr=%s count=%d size=%d\n",
+                            HResultToString(hrCaps).c_str(), count, size);
                     }
 
                     SAFE_RELEASE(cfg);
@@ -716,10 +765,9 @@ static HRESULT enumerate_devices_and_formats() {
                 for (auto& kv : uniq) {
                     dev.formats.push_back(kv.second);
                 }
-
-                SAFE_RELEASE(cap);
-                SAFE_RELEASE(graph);
             }
+            SAFE_RELEASE(cap);
+            SAFE_RELEASE(graph);
 
             SAFE_RELEASE(filter);
         }
@@ -887,6 +935,8 @@ static HRESULT build_capture_graph_rgb32(
     const DsDevice& dev,
     uint32_t streamCapsIndex)
 {
+    constexpr int kMaxStreamCapsBytes = 1024 * 1024;
+
     HRESULT hr;
 
     hr = CoCreateInstance(CLSID_FilterGraph, nullptr, CLSCTX_INPROC_SERVER, IID_IGraphBuilder, (void**)&s->graph);
@@ -1001,7 +1051,14 @@ static HRESULT build_capture_graph_rgb32(
     if (FAILED(hr) || !cfg) return E_FAIL;
 
     int count = 0, size = 0;
-    cfg->GetNumberOfCapabilities(&count, &size);
+    HRESULT hrCaps = cfg->GetNumberOfCapabilities(&count, &size);
+    if (FAILED(hrCaps) ||
+        count <= 0 ||
+        size < (int)sizeof(VIDEO_STREAM_CONFIG_CAPS) ||
+        size > kMaxStreamCapsBytes) {
+        SAFE_RELEASE(cfg);
+        return E_FAIL;
+    }
 
     if ((int)streamCapsIndex >= count) { SAFE_RELEASE(cfg); return E_FAIL; }
 
@@ -1020,8 +1077,11 @@ static HRESULT build_capture_graph_rgb32(
 
     if (mt->formattype == FORMAT_VideoInfo && mt->pbFormat) {
         auto vih = (VIDEOINFOHEADER*)mt->pbFormat;
-        s->width = vih->bmiHeader.biWidth;
-        s->height = abs(vih->bmiHeader.biHeight);
+        if (!try_get_vih_dimensions(vih, s->width, s->height)) {
+            free_am_media_type(mt);
+            SAFE_RELEASE(cfg);
+            return E_FAIL;
+        }
     }
 
     free_am_media_type(mt);
@@ -1048,7 +1108,12 @@ static HRESULT build_capture_graph_rgb32(
     vih.bmiHeader.biPlanes = 1;
     vih.bmiHeader.biBitCount = 32;
     vih.bmiHeader.biCompression = BI_RGB;
-    vih.bmiHeader.biSizeImage = s->width * s->height * 4;
+    size_t rowBytes = 0;
+    size_t frameBytes = 0;
+    if (!calc_frame_layout_bytes(s->width, s->height, rowBytes, frameBytes)) return E_FAIL;
+    if (rowBytes > (size_t)std::numeric_limits<int32_t>::max()) return E_FAIL;
+    if (frameBytes > std::numeric_limits<DWORD>::max()) return E_FAIL;
+    vih.bmiHeader.biSizeImage = (DWORD)frameBytes;
 
     AM_MEDIA_TYPE rgb{};
     rgb.majortype = MEDIATYPE_Video;
@@ -1056,6 +1121,7 @@ static HRESULT build_capture_graph_rgb32(
     rgb.formattype = FORMAT_VideoInfo;
     rgb.cbFormat = sizeof(VIDEOINFOHEADER);
     rgb.pbFormat = (BYTE*)CoTaskMemAlloc(sizeof(VIDEOINFOHEADER));
+    if (!rgb.pbFormat) return E_OUTOFMEMORY;
     memcpy(rgb.pbFormat, &vih, sizeof(VIDEOINFOHEADER));
 
     hr = s->grabber->SetMediaType(&rgb);
@@ -1125,7 +1191,7 @@ static HRESULT build_capture_graph_rgb32(
     if (FAILED(hr) || !s->mc) return FAILED(hr) ? hr : E_FAIL;
     s->graph->QueryInterface(IID_IMediaEvent, (void**)&s->me);
 
-    s->lastRgb.resize((size_t)s->width * s->height * 4);
+    s->lastRgb.resize(frameBytes);
 
     return S_OK;
 }
@@ -1249,6 +1315,7 @@ extern "C" {
 
         if (didInit) CoUninitialize();
         g_dsInitialized = true;
+        ++g_dsGeneration;
         return CDS_OK;
     }
 
@@ -1257,6 +1324,8 @@ extern "C" {
         std::vector<uint32_t> toStop;
         {
             std::lock_guard<std::mutex> lk(g_dsMutex);
+            g_dsInitialized = false;
+            ++g_dsGeneration;
             for (auto& kv : g_dsSessions) toStop.push_back(kv.first);
         }
         for (auto idx : toStop) {
@@ -1399,6 +1468,7 @@ extern "C" {
     SP_API cds_result_t SP_CALL cds_start_capture_with_format(uint32_t device_index, uint32_t format_index) {
         DsDevice devCopy;
         uint32_t streamCapsIndex = 0;
+        uint64_t generationSnapshot = 0;
 
         {
             std::lock_guard<std::mutex> lk(g_dsMutex);
@@ -1407,6 +1477,7 @@ extern "C" {
             if (g_dsSessions.count(device_index)) return CDS_ERR_ALREADY_STARTED;
             if (format_index >= g_dsDevices[device_index].formats.size()) return CDS_ERR_FORMAT_NOT_FOUND;
 
+            generationSnapshot = g_dsGeneration;
             devCopy = g_dsDevices[device_index];
             streamCapsIndex = g_dsDevices[device_index].formats[format_index].streamCapsIndex;
         }
@@ -1415,7 +1486,13 @@ extern "C" {
         if (!s) return CDS_ERR_UNKNOWN;
 
         s->stopRequested.store(false);
-        s->worker = std::thread(session_thread_main, s, devCopy, streamCapsIndex);
+        try {
+            s->worker = std::thread(session_thread_main, s, devCopy, streamCapsIndex);
+        }
+        catch (...) {
+            delete s;
+            return CDS_ERR_UNKNOWN;
+        }
 
         cds_result_t startRc = CDS_ERR_UNKNOWN;
         {
@@ -1431,15 +1508,25 @@ extern "C" {
             return startRc;
         }
 
+        bool rejectedNotInitialized = false;
+        bool rejectedAlreadyStarted = false;
         {
             std::lock_guard<std::mutex> lk(g_dsMutex);
-            if (g_dsSessions.count(device_index)) {
-                s->stopRequested.store(true);
-                if (s->worker.joinable()) s->worker.join();
-                delete s;
-                return CDS_ERR_ALREADY_STARTED;
+            if (!g_dsInitialized || generationSnapshot != g_dsGeneration) {
+                rejectedNotInitialized = true;
             }
-            g_dsSessions[device_index] = s;
+            else if (g_dsSessions.count(device_index)) {
+                rejectedAlreadyStarted = true;
+            }
+            else {
+                g_dsSessions[device_index] = s;
+            }
+        }
+        if (rejectedNotInitialized || rejectedAlreadyStarted) {
+            s->stopRequested.store(true);
+            if (s->worker.joinable()) s->worker.join();
+            delete s;
+            return rejectedNotInitialized ? CDS_ERR_NOT_INITIALIZED : CDS_ERR_ALREADY_STARTED;
         }
 
         return CDS_OK;
@@ -1469,17 +1556,17 @@ extern "C" {
     }
 
     SP_API cds_result_t SP_CALL cds_grab_frame(uint32_t device_index, uint8_t* buffer, size_t available_bytes) {
-        DsSession* s = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(g_dsMutex);
-            auto it = g_dsSessions.find(device_index);
-            if (it == g_dsSessions.end()) return CDS_ERR_NOT_STARTED;
-            s = it->second;
-        }
+        std::lock_guard<std::mutex> lk(g_dsMutex);
+        auto it = g_dsSessions.find(device_index);
+        if (it == g_dsSessions.end()) return CDS_ERR_NOT_STARTED;
+        DsSession* s = it->second;
 
         if (!buffer) return CDS_ERR_BUF_NULL;
 
-        const size_t needed = (size_t)s->width * (size_t)s->height * 4;
+        size_t rowBytes = 0;
+        size_t needed = 0;
+        if (!calc_frame_layout_bytes(s->width, s->height, rowBytes, needed)) return CDS_ERR_READ_FRAME;
+        if (rowBytes > (size_t)std::numeric_limits<int32_t>::max()) return CDS_ERR_READ_FRAME;
         if (available_bytes < needed) return CDS_ERR_BUF_TOO_SMALL;
 
         std::lock_guard<std::mutex> lk2(s->frameMutex);
