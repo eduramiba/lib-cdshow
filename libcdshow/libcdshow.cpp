@@ -567,7 +567,7 @@ static bool try_get_vih_dimensions(const VIDEOINFOHEADER* vih, uint32_t& width, 
     if (!vih) return false;
     LONG w = vih->bmiHeader.biWidth;
     LONG h = vih->bmiHeader.biHeight;
-    if (w <= 0 || h == 0 || h == std::numeric_limits<LONG>::min()) return false;
+    if (w <= 0 || h == 0 || h == (std::numeric_limits<LONG>::min)()) return false;
 
     width = (uint32_t)w;
     height = (uint32_t)(h < 0 ? -h : h);
@@ -1111,8 +1111,8 @@ static HRESULT build_capture_graph_rgb32(
     size_t rowBytes = 0;
     size_t frameBytes = 0;
     if (!calc_frame_layout_bytes(s->width, s->height, rowBytes, frameBytes)) return E_FAIL;
-    if (rowBytes > (size_t)std::numeric_limits<int32_t>::max()) return E_FAIL;
-    if (frameBytes > std::numeric_limits<DWORD>::max()) return E_FAIL;
+    if (rowBytes > (size_t)(std::numeric_limits<int32_t>::max)()) return E_FAIL;
+    if (frameBytes > (std::numeric_limits<DWORD>::max)()) return E_FAIL;
     vih.bmiHeader.biSizeImage = (DWORD)frameBytes;
 
     AM_MEDIA_TYPE rgb{};
@@ -1566,7 +1566,7 @@ extern "C" {
         size_t rowBytes = 0;
         size_t needed = 0;
         if (!calc_frame_layout_bytes(s->width, s->height, rowBytes, needed)) return CDS_ERR_READ_FRAME;
-        if (rowBytes > (size_t)std::numeric_limits<int32_t>::max()) return CDS_ERR_READ_FRAME;
+        if (rowBytes > (size_t)(std::numeric_limits<int32_t>::max)()) return CDS_ERR_READ_FRAME;
         if (available_bytes < needed) return CDS_ERR_BUF_TOO_SMALL;
 
         std::lock_guard<std::mutex> lk2(s->frameMutex);
