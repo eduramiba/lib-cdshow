@@ -25,10 +25,37 @@ extern "C" {
 #define CDS_ERR_ALREADY_STARTED  -4
 #define CDS_ERR_NOT_STARTED      -5
 #define CDS_ERR_NOT_INITIALIZED  -6
+#define CDS_ERR_INVALID_ARGUMENT -7
 #define CDS_ERR_READ_FRAME       -8
+#define CDS_ERR_CONTROL_NOT_SUPPORTED -9
 #define CDS_ERR_BUF_NULL         -10
 #define CDS_ERR_BUF_TOO_SMALL    -11
+#define CDS_ERR_CONTROL_IO       -12
 #define CDS_ERR_UNKNOWN          -512
+
+	// Camera control property IDs match DirectShow's VideoProcAmpProperty /
+	// CameraControlProperty values so callers do not need Windows headers.
+#define CDS_CONTROL_FLAG_AUTO    0x0001
+#define CDS_CONTROL_FLAG_MANUAL  0x0002
+
+#define CDS_VIDEO_PROCAMP_BRIGHTNESS             0
+#define CDS_VIDEO_PROCAMP_CONTRAST               1
+#define CDS_VIDEO_PROCAMP_HUE                    2
+#define CDS_VIDEO_PROCAMP_SATURATION             3
+#define CDS_VIDEO_PROCAMP_SHARPNESS              4
+#define CDS_VIDEO_PROCAMP_GAMMA                  5
+#define CDS_VIDEO_PROCAMP_COLORENABLE            6
+#define CDS_VIDEO_PROCAMP_WHITEBALANCE           7
+#define CDS_VIDEO_PROCAMP_BACKLIGHTCOMPENSATION  8
+#define CDS_VIDEO_PROCAMP_GAIN                   9
+
+#define CDS_CAMERA_CONTROL_PAN                   0
+#define CDS_CAMERA_CONTROL_TILT                  1
+#define CDS_CAMERA_CONTROL_ROLL                  2
+#define CDS_CAMERA_CONTROL_ZOOM                  3
+#define CDS_CAMERA_CONTROL_EXPOSURE              4
+#define CDS_CAMERA_CONTROL_IRIS                  5
+#define CDS_CAMERA_CONTROL_FOCUS                 6
 
 	SP_API cds_result_t SP_CALL cds_initialize(void);
 	SP_API void         SP_CALL cds_shutdown_capture_api(void);
@@ -66,6 +93,47 @@ extern "C" {
 	SP_API int32_t SP_CALL cds_frame_width(uint32_t device_index);
 	SP_API int32_t SP_CALL cds_frame_height(uint32_t device_index);
 	SP_API int32_t SP_CALL cds_frame_bytes_per_row(uint32_t device_index);
+
+	// VideoProcAmp controls (brightness, contrast, hue, saturation, sharpness,
+	// gamma, color enable, white balance, backlight compensation, gain)
+	SP_API cds_result_t SP_CALL cds_get_video_proc_amp_range(
+		int32_t device_index,
+		int32_t property,
+		int32_t* min_value,
+		int32_t* max_value,
+		int32_t* step,
+		int32_t* default_value,
+		int32_t* caps_flags);
+	SP_API cds_result_t SP_CALL cds_get_video_proc_amp(
+		int32_t device_index,
+		int32_t property,
+		int32_t* value,
+		int32_t* flags);
+	SP_API cds_result_t SP_CALL cds_set_video_proc_amp(
+		int32_t device_index,
+		int32_t property,
+		int32_t value,
+		int32_t flags);
+
+	// CameraControl controls (pan, tilt, roll, zoom, exposure, iris, focus)
+	SP_API cds_result_t SP_CALL cds_get_camera_control_range(
+		int32_t device_index,
+		int32_t property,
+		int32_t* min_value,
+		int32_t* max_value,
+		int32_t* step,
+		int32_t* default_value,
+		int32_t* caps_flags);
+	SP_API cds_result_t SP_CALL cds_get_camera_control(
+		int32_t device_index,
+		int32_t property,
+		int32_t* value,
+		int32_t* flags);
+	SP_API cds_result_t SP_CALL cds_set_camera_control(
+		int32_t device_index,
+		int32_t property,
+		int32_t value,
+		int32_t flags);
 
 	// Button press detection WHILE STREAMING (integrated into cds session)
 	SP_API int32_t  SP_CALL cds_button_pressed(uint32_t device_index);     // returns 1 once per press (edge), then 0

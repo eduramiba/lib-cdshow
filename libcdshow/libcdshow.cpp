@@ -396,6 +396,29 @@ struct DsDevice {
 struct DsSession;
 static uint64_t now_ts100ns_utc();
 static bool calc_frame_layout_bytes(uint32_t width, uint32_t height, size_t& rowBytes, size_t& totalBytes);
+static HRESULT bind_moniker_by_display_name(const std::wstring& displayName, IMoniker** outMk);
+
+enum class DsControlApi {
+    VideoProcAmp,
+    CameraControl
+};
+
+enum class DsControlRequestType {
+    None,
+    GetRange,
+    Get,
+    Set
+};
+
+struct DsControlPayload {
+    long value = 0;
+    long flags = 0;
+    long minValue = 0;
+    long maxValue = 0;
+    long step = 0;
+    long defaultValue = 0;
+    long capabilities = 0;
+};
 
 class FrameGrabberCB : public ISampleGrabberCB {
 public:
@@ -471,6 +494,19 @@ struct DsSession {
     bool vcHasTrigger = false;
     bool useStillFallback = false;
 
+    // ---- Camera property control ----
+    IAMVideoProcAmp* videoProcAmp = nullptr;   // thread-owned
+    IAMCameraControl* cameraControl = nullptr; // thread-owned
+    std::mutex controlMutex;
+    std::condition_variable controlCv;
+    bool controlRequestPending = false;
+    bool controlRequestCompleted = false;
+    DsControlApi controlApi = DsControlApi::VideoProcAmp;
+    DsControlRequestType controlRequestType = DsControlRequestType::None;
+    long controlProperty = 0;
+    DsControlPayload controlPayload{};
+    HRESULT controlRequestHr = E_FAIL;
+
     std::atomic<bool> stopRequested{ false };
     std::thread worker;
     std::mutex startMutex;
@@ -510,6 +546,8 @@ struct DsSession {
 
         SAFE_RELEASE(stillPinVC);
         SAFE_RELEASE(videoCtrl);
+        SAFE_RELEASE(videoProcAmp);
+        SAFE_RELEASE(cameraControl);
 
         SAFE_RELEASE(capFilter);
         SAFE_RELEASE(cap);
@@ -581,6 +619,241 @@ static bool calc_frame_layout_bytes(uint32_t width, uint32_t height, size_t& row
     if ((size_t)height > (SIZE_MAX / rowBytes)) return false;
     totalBytes = rowBytes * (size_t)height;
     return true;
+}
+
+static HRESULT co_initialize_for_api_call(bool& didInit) {
+    didInit = false;
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (SUCCEEDED(hr)) {
+        didInit = true;
+        return hr;
+    }
+    if (hr == RPC_E_CHANGED_MODE) {
+        return S_OK;
+    }
+    return hr;
+}
+
+static cds_result_t control_hresult_to_result(HRESULT hr) {
+    if (SUCCEEDED(hr)) return CDS_OK;
+    if (hr == E_POINTER || hr == E_INVALIDARG) return CDS_ERR_INVALID_ARGUMENT;
+    if (hr == E_NOINTERFACE ||
+        hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) ||
+        hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
+        return CDS_ERR_CONTROL_NOT_SUPPORTED;
+    }
+    return CDS_ERR_CONTROL_IO;
+}
+
+static HRESULT bind_filter_by_device(const DsDevice& dev, IBaseFilter** outFilter) {
+    if (!outFilter) return E_POINTER;
+    *outFilter = nullptr;
+
+    IMoniker* mk = nullptr;
+    HRESULT hr = bind_moniker_by_display_name(dev.monikerDisplayNameW, &mk);
+    if (FAILED(hr) || !mk) return FAILED(hr) ? hr : E_FAIL;
+
+    hr = mk->BindToObject(nullptr, nullptr, IID_IBaseFilter, (void**)outFilter);
+    mk->Release();
+    return hr;
+}
+
+static HRESULT execute_control_request(
+    DsControlApi api,
+    IAMVideoProcAmp* videoProcAmp,
+    IAMCameraControl* cameraControl,
+    DsControlRequestType requestType,
+    long property,
+    DsControlPayload* payload)
+{
+    if (!payload) return E_POINTER;
+
+    switch (api) {
+    case DsControlApi::VideoProcAmp:
+        if (!videoProcAmp) return E_NOINTERFACE;
+        switch (requestType) {
+        case DsControlRequestType::GetRange:
+            return videoProcAmp->GetRange(
+                property,
+                &payload->minValue,
+                &payload->maxValue,
+                &payload->step,
+                &payload->defaultValue,
+                &payload->capabilities);
+        case DsControlRequestType::Get:
+            return videoProcAmp->Get(property, &payload->value, &payload->flags);
+        case DsControlRequestType::Set:
+            return videoProcAmp->Set(property, payload->value, payload->flags);
+        default:
+            return E_INVALIDARG;
+        }
+
+    case DsControlApi::CameraControl:
+        if (!cameraControl) return E_NOINTERFACE;
+        switch (requestType) {
+        case DsControlRequestType::GetRange:
+            return cameraControl->GetRange(
+                property,
+                &payload->minValue,
+                &payload->maxValue,
+                &payload->step,
+                &payload->defaultValue,
+                &payload->capabilities);
+        case DsControlRequestType::Get:
+            return cameraControl->Get(property, &payload->value, &payload->flags);
+        case DsControlRequestType::Set:
+            return cameraControl->Set(property, payload->value, payload->flags);
+        default:
+            return E_INVALIDARG;
+        }
+    }
+
+    return E_INVALIDARG;
+}
+
+static cds_result_t execute_control_request_with_temporary_filter(
+    const DsDevice& dev,
+    DsControlApi api,
+    DsControlRequestType requestType,
+    long property,
+    DsControlPayload* payload)
+{
+    if (!payload) return CDS_ERR_INVALID_ARGUMENT;
+
+    bool didInit = false;
+    HRESULT hr = co_initialize_for_api_call(didInit);
+    if (FAILED(hr)) return CDS_ERR_CONTROL_IO;
+
+    IBaseFilter* filter = nullptr;
+    IAMVideoProcAmp* videoProcAmp = nullptr;
+    IAMCameraControl* cameraControl = nullptr;
+
+    hr = bind_filter_by_device(dev, &filter);
+    if (SUCCEEDED(hr) && filter) {
+        if (api == DsControlApi::VideoProcAmp) {
+            hr = filter->QueryInterface(IID_IAMVideoProcAmp, (void**)&videoProcAmp);
+        }
+        else {
+            hr = filter->QueryInterface(IID_IAMCameraControl, (void**)&cameraControl);
+        }
+    }
+
+    if (SUCCEEDED(hr)) {
+        hr = execute_control_request(api, videoProcAmp, cameraControl, requestType, property, payload);
+    }
+
+    SAFE_RELEASE(cameraControl);
+    SAFE_RELEASE(videoProcAmp);
+    SAFE_RELEASE(filter);
+    if (didInit) CoUninitialize();
+
+    return control_hresult_to_result(hr);
+}
+
+static void process_pending_control_request(DsSession* s) {
+    if (!s) return;
+
+    DsControlApi api = DsControlApi::VideoProcAmp;
+    DsControlRequestType requestType = DsControlRequestType::None;
+    long property = 0;
+    DsControlPayload payload{};
+
+    {
+        std::unique_lock<std::mutex> lk(s->controlMutex);
+        if (!s->controlRequestPending) return;
+        api = s->controlApi;
+        requestType = s->controlRequestType;
+        property = s->controlProperty;
+        payload = s->controlPayload;
+        s->controlRequestPending = false;
+    }
+
+    HRESULT hr = execute_control_request(
+        api,
+        s->videoProcAmp,
+        s->cameraControl,
+        requestType,
+        property,
+        &payload);
+
+    {
+        std::lock_guard<std::mutex> lk(s->controlMutex);
+        s->controlPayload = payload;
+        s->controlRequestHr = hr;
+        s->controlRequestCompleted = true;
+        s->controlRequestType = DsControlRequestType::None;
+    }
+    s->controlCv.notify_all();
+}
+
+static void fail_pending_control_request(DsSession* s, HRESULT hr) {
+    if (!s) return;
+
+    bool notify = false;
+    {
+        std::lock_guard<std::mutex> lk(s->controlMutex);
+        if (s->controlRequestPending || s->controlRequestType != DsControlRequestType::None) {
+            s->controlRequestPending = false;
+            s->controlRequestCompleted = true;
+            s->controlRequestType = DsControlRequestType::None;
+            s->controlRequestHr = hr;
+            notify = true;
+        }
+    }
+
+    if (notify) {
+        s->controlCv.notify_all();
+    }
+}
+
+static cds_result_t execute_control_request_with_active_session_locked(
+    DsSession* s,
+    DsControlApi api,
+    DsControlRequestType requestType,
+    long property,
+    DsControlPayload* payload)
+{
+    if (!s || !payload) return CDS_ERR_INVALID_ARGUMENT;
+
+    std::unique_lock<std::mutex> lk(s->controlMutex);
+    s->controlApi = api;
+    s->controlRequestType = requestType;
+    s->controlProperty = property;
+    s->controlPayload = *payload;
+    s->controlRequestHr = E_FAIL;
+    s->controlRequestCompleted = false;
+    s->controlRequestPending = true;
+    lk.unlock();
+    s->controlCv.notify_all();
+
+    lk.lock();
+    s->controlCv.wait(lk, [&]() { return s->controlRequestCompleted; });
+    *payload = s->controlPayload;
+    return control_hresult_to_result(s->controlRequestHr);
+}
+
+static cds_result_t execute_device_control_request(
+    int32_t device_index,
+    DsControlApi api,
+    DsControlRequestType requestType,
+    long property,
+    DsControlPayload* payload)
+{
+    std::lock_guard<std::mutex> lk(g_dsMutex);
+    if (!g_dsInitialized) return CDS_ERR_NOT_INITIALIZED;
+    if (device_index < 0 || (size_t)device_index >= g_dsDevices.size()) return CDS_ERR_DEVICE_NOT_FOUND;
+
+    auto it = g_dsSessions.find((uint32_t)device_index);
+    if (it != g_dsSessions.end()) {
+        return execute_control_request_with_active_session_locked(it->second, api, requestType, property, payload);
+    }
+
+    return execute_control_request_with_temporary_filter(
+        g_dsDevices[(size_t)device_index],
+        api,
+        requestType,
+        property,
+        payload);
 }
 
 // ---- Rebind by moniker display name ----
@@ -961,6 +1234,12 @@ static HRESULT build_capture_graph_rgb32(
 
     DumpFilterPins(s->capFilter, "AfterAddFilter");
 
+    HRESULT hrProcAmp = s->capFilter->QueryInterface(IID_IAMVideoProcAmp, (void**)&s->videoProcAmp);
+    dbg_printf("QI(IAMVideoProcAmp) => %s\n", HResultToString(hrProcAmp).c_str());
+
+    HRESULT hrCameraCtrl = s->capFilter->QueryInterface(IID_IAMCameraControl, (void**)&s->cameraControl);
+    dbg_printf("QI(IAMCameraControl) => %s\n", HResultToString(hrCameraCtrl).c_str());
+
     // -----------------------------
     // IAMVideoControl trigger setup
     // -----------------------------
@@ -1228,6 +1507,8 @@ static void session_thread_main(DsSession* s, DsDevice devCopy, uint32_t streamC
         else {
             signal_start(CDS_OK);
             while (!s->stopRequested.load()) {
+                process_pending_control_request(s);
+
                 if (!s->useStillFallback && s->vcHasTrigger && s->videoCtrl && s->stillPinVC) {
                     long mode = 0;
                     HRESULT hrMode = s->videoCtrl->GetMode(s->stillPinVC, &mode);
@@ -1284,10 +1565,84 @@ static void session_thread_main(DsSession* s, DsDevice devCopy, uint32_t streamC
 
     // Ensure waiter is always released even on unexpected paths.
     signal_start(CDS_ERR_OPENING_DEVICE);
+    fail_pending_control_request(s, HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED));
 
     // FULL TEARDOWN (same thread)
     s->release_graph_thread_only();
     CoUninitialize();
+}
+
+static cds_result_t export_get_control_range(
+    DsControlApi api,
+    int32_t device_index,
+    int32_t property,
+    int32_t* min_value,
+    int32_t* max_value,
+    int32_t* step,
+    int32_t* default_value,
+    int32_t* caps_flags)
+{
+    if (!min_value || !max_value || !step || !default_value || !caps_flags) {
+        return CDS_ERR_INVALID_ARGUMENT;
+    }
+
+    DsControlPayload payload{};
+    cds_result_t rc = execute_device_control_request(
+        device_index,
+        api,
+        DsControlRequestType::GetRange,
+        (long)property,
+        &payload);
+    if (rc != CDS_OK) return rc;
+
+    *min_value = (int32_t)payload.minValue;
+    *max_value = (int32_t)payload.maxValue;
+    *step = (int32_t)payload.step;
+    *default_value = (int32_t)payload.defaultValue;
+    *caps_flags = (int32_t)payload.capabilities;
+    return CDS_OK;
+}
+
+static cds_result_t export_get_control(
+    DsControlApi api,
+    int32_t device_index,
+    int32_t property,
+    int32_t* value,
+    int32_t* flags)
+{
+    if (!value || !flags) return CDS_ERR_INVALID_ARGUMENT;
+
+    DsControlPayload payload{};
+    cds_result_t rc = execute_device_control_request(
+        device_index,
+        api,
+        DsControlRequestType::Get,
+        (long)property,
+        &payload);
+    if (rc != CDS_OK) return rc;
+
+    *value = (int32_t)payload.value;
+    *flags = (int32_t)payload.flags;
+    return CDS_OK;
+}
+
+static cds_result_t export_set_control(
+    DsControlApi api,
+    int32_t device_index,
+    int32_t property,
+    int32_t value,
+    int32_t flags)
+{
+    DsControlPayload payload{};
+    payload.value = (long)value;
+    payload.flags = (long)flags;
+
+    return execute_device_control_request(
+        device_index,
+        api,
+        DsControlRequestType::Set,
+        (long)property,
+        &payload);
 }
 
 // =============================================================================
@@ -1595,6 +1950,102 @@ extern "C" {
         auto it = g_dsSessions.find(device_index);
         if (it == g_dsSessions.end()) return 0;
         return (int32_t)it->second->width * 4;
+    }
+
+    SP_API cds_result_t SP_CALL cds_get_video_proc_amp_range(
+        int32_t device_index,
+        int32_t property,
+        int32_t* min_value,
+        int32_t* max_value,
+        int32_t* step,
+        int32_t* default_value,
+        int32_t* caps_flags)
+    {
+        return export_get_control_range(
+            DsControlApi::VideoProcAmp,
+            device_index,
+            property,
+            min_value,
+            max_value,
+            step,
+            default_value,
+            caps_flags);
+    }
+
+    SP_API cds_result_t SP_CALL cds_get_video_proc_amp(
+        int32_t device_index,
+        int32_t property,
+        int32_t* value,
+        int32_t* flags)
+    {
+        return export_get_control(
+            DsControlApi::VideoProcAmp,
+            device_index,
+            property,
+            value,
+            flags);
+    }
+
+    SP_API cds_result_t SP_CALL cds_set_video_proc_amp(
+        int32_t device_index,
+        int32_t property,
+        int32_t value,
+        int32_t flags)
+    {
+        return export_set_control(
+            DsControlApi::VideoProcAmp,
+            device_index,
+            property,
+            value,
+            flags);
+    }
+
+    SP_API cds_result_t SP_CALL cds_get_camera_control_range(
+        int32_t device_index,
+        int32_t property,
+        int32_t* min_value,
+        int32_t* max_value,
+        int32_t* step,
+        int32_t* default_value,
+        int32_t* caps_flags)
+    {
+        return export_get_control_range(
+            DsControlApi::CameraControl,
+            device_index,
+            property,
+            min_value,
+            max_value,
+            step,
+            default_value,
+            caps_flags);
+    }
+
+    SP_API cds_result_t SP_CALL cds_get_camera_control(
+        int32_t device_index,
+        int32_t property,
+        int32_t* value,
+        int32_t* flags)
+    {
+        return export_get_control(
+            DsControlApi::CameraControl,
+            device_index,
+            property,
+            value,
+            flags);
+    }
+
+    SP_API cds_result_t SP_CALL cds_set_camera_control(
+        int32_t device_index,
+        int32_t property,
+        int32_t value,
+        int32_t flags)
+    {
+        return export_set_control(
+            DsControlApi::CameraControl,
+            device_index,
+            property,
+            value,
+            flags);
     }
 
     // Button while streaming: edge-trigger (1 once)

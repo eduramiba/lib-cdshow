@@ -12,6 +12,32 @@ DLL_PATH = os.path.abspath("x64/Release/libcdshow.dll")
 dll = ctypes.WinDLL(DLL_PATH)  # stdcall
 
 CDS_OK = 0
+CDS_ERR_CONTROL_NOT_SUPPORTED = -9
+CDS_CONTROL_FLAG_AUTO = 0x0001
+CDS_CONTROL_FLAG_MANUAL = 0x0002
+
+VIDEO_PROCAMP_CONTROLS = [
+    ("brightness", 0),
+    ("contrast", 1),
+    ("hue", 2),
+    ("saturation", 3),
+    ("sharpness", 4),
+    ("gamma", 5),
+    ("color_enable", 6),
+    ("white_balance", 7),
+    ("backlight_compensation", 8),
+    ("gain", 9),
+]
+
+CAMERA_CONTROLS = [
+    ("pan", 0),
+    ("tilt", 1),
+    ("roll", 2),
+    ("zoom", 3),
+    ("exposure", 4),
+    ("iris", 5),
+    ("focus", 6),
+]
 
 # ==========================
 # Prototypes
@@ -43,6 +69,56 @@ dll.cds_frame_height.restype = ctypes.c_int32
 
 dll.cds_grab_frame.restype = ctypes.c_int32
 dll.cds_grab_frame.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
+
+dll.cds_get_video_proc_amp_range.restype = ctypes.c_int32
+dll.cds_get_video_proc_amp_range.argtypes = [
+    ctypes.c_int32,
+    ctypes.c_int32,
+    ctypes.POINTER(ctypes.c_int32),
+    ctypes.POINTER(ctypes.c_int32),
+    ctypes.POINTER(ctypes.c_int32),
+    ctypes.POINTER(ctypes.c_int32),
+    ctypes.POINTER(ctypes.c_int32),
+]
+dll.cds_get_video_proc_amp.restype = ctypes.c_int32
+dll.cds_get_video_proc_amp.argtypes = [
+    ctypes.c_int32,
+    ctypes.c_int32,
+    ctypes.POINTER(ctypes.c_int32),
+    ctypes.POINTER(ctypes.c_int32),
+]
+dll.cds_set_video_proc_amp.restype = ctypes.c_int32
+dll.cds_set_video_proc_amp.argtypes = [
+    ctypes.c_int32,
+    ctypes.c_int32,
+    ctypes.c_int32,
+    ctypes.c_int32,
+]
+
+dll.cds_get_camera_control_range.restype = ctypes.c_int32
+dll.cds_get_camera_control_range.argtypes = [
+    ctypes.c_int32,
+    ctypes.c_int32,
+    ctypes.POINTER(ctypes.c_int32),
+    ctypes.POINTER(ctypes.c_int32),
+    ctypes.POINTER(ctypes.c_int32),
+    ctypes.POINTER(ctypes.c_int32),
+    ctypes.POINTER(ctypes.c_int32),
+]
+dll.cds_get_camera_control.restype = ctypes.c_int32
+dll.cds_get_camera_control.argtypes = [
+    ctypes.c_int32,
+    ctypes.c_int32,
+    ctypes.POINTER(ctypes.c_int32),
+    ctypes.POINTER(ctypes.c_int32),
+]
+dll.cds_set_camera_control.restype = ctypes.c_int32
+dll.cds_set_camera_control.argtypes = [
+    ctypes.c_int32,
+    ctypes.c_int32,
+    ctypes.c_int32,
+    ctypes.c_int32,
+]
 
 dll.cds_button_pressed.restype = ctypes.c_int32
 dll.cds_button_timestamp.restype = ctypes.c_uint64
@@ -77,6 +153,53 @@ def pick_device_index():
         return non_fhd[0]
     return devices[0][0]
 
+
+def flags_to_text(flags):
+    names = []
+    if flags & CDS_CONTROL_FLAG_AUTO:
+        names.append("auto")
+    if flags & CDS_CONTROL_FLAG_MANUAL:
+        names.append("manual")
+    return "|".join(names) if names else "none"
+
+
+def dump_controls(dev_index, title, controls, get_range_fn, get_fn):
+    print(title)
+    for name, prop in controls:
+        min_value = ctypes.c_int32()
+        max_value = ctypes.c_int32()
+        step = ctypes.c_int32()
+        default_value = ctypes.c_int32()
+        caps_flags = ctypes.c_int32()
+
+        rc = get_range_fn(
+            dev_index,
+            prop,
+            ctypes.byref(min_value),
+            ctypes.byref(max_value),
+            ctypes.byref(step),
+            ctypes.byref(default_value),
+            ctypes.byref(caps_flags),
+        )
+        if rc == CDS_ERR_CONTROL_NOT_SUPPORTED:
+            continue
+        if rc != CDS_OK:
+            print(f"  {name}: range error {rc}")
+            continue
+
+        value = ctypes.c_int32()
+        current_flags = ctypes.c_int32()
+        rc = get_fn(dev_index, prop, ctypes.byref(value), ctypes.byref(current_flags))
+        if rc != CDS_OK:
+            print(f"  {name}: current value error {rc}")
+            continue
+
+        print(
+            f"  {name}: value={value.value} flags={flags_to_text(current_flags.value)} "
+            f"range=[{min_value.value}, {max_value.value}] step={step.value} "
+            f"default={default_value.value} supported={flags_to_text(caps_flags.value)}"
+        )
+
 # ==========================
 # Main
 # ==========================
@@ -102,6 +225,20 @@ def main():
 
     print("Using device:", get_device_name(dev_index))
     print("Device ID:", get_device_unique_id(dev_index))
+    dump_controls(
+        dev_index,
+        "VideoProcAmp controls:",
+        VIDEO_PROCAMP_CONTROLS,
+        dll.cds_get_video_proc_amp_range,
+        dll.cds_get_video_proc_amp,
+    )
+    dump_controls(
+        dev_index,
+        "CameraControl controls:",
+        CAMERA_CONTROLS,
+        dll.cds_get_camera_control_range,
+        dll.cds_get_camera_control,
+    )
 
     fmt_count = dll.cds_device_formats_count(dev_index)
 
