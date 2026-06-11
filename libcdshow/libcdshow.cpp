@@ -1654,7 +1654,6 @@ extern "C" {
 
     SP_API cds_result_t SP_CALL cds_initialize(void) {
         std::lock_guard<std::mutex> lk(g_dsMutex);
-        if (g_dsInitialized) return CDS_OK;
 
         HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         bool didInit = SUCCEEDED(hr);
