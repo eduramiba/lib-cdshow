@@ -31,7 +31,19 @@ extern "C" {
 #define CDS_ERR_BUF_NULL         -10
 #define CDS_ERR_BUF_TOO_SMALL    -11
 #define CDS_ERR_CONTROL_IO       -12
+#define CDS_ERR_FORMAT_NOT_SUPPORTED -13
 #define CDS_ERR_UNKNOWN          -512
+
+	// Capture output mode. Existing start functions always use BGRA so the ABI
+	// remains backward-compatible.
+#define CDS_OUTPUT_BGRA          0
+#define CDS_OUTPUT_NATIVE        1
+
+	// Actual frame pixel format reported by cds_frame_pixel_format().
+#define CDS_PIXEL_FORMAT_UNKNOWN 0
+#define CDS_PIXEL_FORMAT_BGRA    1
+#define CDS_PIXEL_FORMAT_NV12    2
+#define CDS_PIXEL_FORMAT_YUY2    3
 
 	// Camera control property IDs match DirectShow's VideoProcAmpProperty /
 	// CameraControlProperty values so callers do not need Windows headers.
@@ -84,13 +96,28 @@ extern "C" {
 	// subtype name: "MJPG","YUY2","NV12","RGB24","RGB32", or GUID string
 	SP_API size_t   SP_CALL cds_device_format_type(int32_t device_index, int32_t format_index, char* buf, size_t buf_len);
 
-	// Capture (RGB32 guaranteed, top-down guaranteed)
+	// Capture (RGB32/BGRA guaranteed, top-down guaranteed)
 	// Resolution-only start chooses the highest advertised FPS first, then the
 	// lowest expected conversion/decode cost, and falls back when DirectShow
 	// cannot build/run a candidate. Exact-format start bypasses selection and
 	// fallback. Both request the selected capability's maximum FPS.
 	SP_API cds_result_t SP_CALL cds_start_capture(uint32_t device_index, uint32_t width, uint32_t height);
 	SP_API cds_result_t SP_CALL cds_start_capture_with_format(uint32_t device_index, uint32_t format_index);
+
+	// Output-mode variants. CDS_OUTPUT_NATIVE currently accepts only an exact
+	// native NV12 or YUY2 camera capability and does not insert an application
+	// color conversion. Use the frame layout functions below after start.
+	// Unsupported native subtypes return CDS_ERR_FORMAT_NOT_SUPPORTED so callers
+	// can retry the same mode with CDS_OUTPUT_BGRA.
+	SP_API cds_result_t SP_CALL cds_start_capture_with_output(
+		uint32_t device_index,
+		uint32_t width,
+		uint32_t height,
+		int32_t output_mode);
+	SP_API cds_result_t SP_CALL cds_start_capture_with_format_output(
+		uint32_t device_index,
+		uint32_t format_index,
+		int32_t output_mode);
 	SP_API cds_result_t SP_CALL cds_stop_capture(uint32_t device_index);
 
 	SP_API int32_t      SP_CALL cds_has_first_frame(uint32_t device_index);
@@ -99,6 +126,12 @@ extern "C" {
 	SP_API int32_t SP_CALL cds_frame_width(uint32_t device_index);
 	SP_API int32_t SP_CALL cds_frame_height(uint32_t device_index);
 	SP_API int32_t SP_CALL cds_frame_bytes_per_row(uint32_t device_index);
+	SP_API int32_t SP_CALL cds_frame_data_size(uint32_t device_index);
+	SP_API int32_t SP_CALL cds_frame_pixel_format(uint32_t device_index);
+	SP_API size_t  SP_CALL cds_frame_pixel_format_name(uint32_t device_index, char* buf, size_t buf_len);
+	SP_API int32_t SP_CALL cds_frame_plane_count(uint32_t device_index);
+	SP_API int32_t SP_CALL cds_frame_plane_offset(uint32_t device_index, int32_t plane_index);
+	SP_API int32_t SP_CALL cds_frame_plane_bytes_per_row(uint32_t device_index, int32_t plane_index);
 
 	// VideoProcAmp controls (brightness, contrast, hue, saturation, sharpness,
 	// gamma, color enable, white balance, backlight compensation, gain)

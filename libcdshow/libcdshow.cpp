@@ -135,6 +135,32 @@ static int SubTypeProcessingRank(const GUID& st) {
     return PROCESSING_UNKNOWN;
 }
 
+static int PixelFormatFromSubtype(const GUID& subtype) {
+    if (subtype == MEDIASUBTYPE_RGB32 || subtype == MEDIASUBTYPE_ARGB32) {
+        return CDS_PIXEL_FORMAT_BGRA;
+    }
+    if (subtype == MEDIASUBTYPE_NV12) {
+        return CDS_PIXEL_FORMAT_NV12;
+    }
+    if (subtype == MEDIASUBTYPE_YUY2) {
+        return CDS_PIXEL_FORMAT_YUY2;
+    }
+    return CDS_PIXEL_FORMAT_UNKNOWN;
+}
+
+static const char* PixelFormatName(int pixelFormat) {
+    switch (pixelFormat) {
+    case CDS_PIXEL_FORMAT_BGRA:
+        return "BGRA";
+    case CDS_PIXEL_FORMAT_NV12:
+        return "NV12";
+    case CDS_PIXEL_FORMAT_YUY2:
+        return "YUY2";
+    default:
+        return "UNKNOWN";
+    }
+}
+
 static std::string HResultToString(HRESULT hr) {
     _com_error err(hr);
     wchar_t const* msg = err.ErrorMessage();
@@ -408,7 +434,16 @@ struct DsDevice {
 struct DsSession;
 static uint64_t now_ts100ns_utc();
 static bool calc_frame_layout_bytes(uint32_t width, uint32_t height, size_t& rowBytes, size_t& totalBytes);
+static bool update_native_layout_from_sample_length(DsSession* session, size_t sampleBytes);
 static HRESULT bind_moniker_by_display_name(const std::wstring& displayName, IMoniker** outMk);
+
+struct DsFrameLayout {
+    int pixelFormat = CDS_PIXEL_FORMAT_UNKNOWN;
+    size_t dataBytes = 0;
+    int planeCount = 0;
+    size_t planeOffsets[2] = { 0, 0 };
+    size_t planeStrides[2] = { 0, 0 };
+};
 
 enum class DsControlApi {
     VideoProcAmp,
@@ -488,11 +523,13 @@ struct DsSession {
     uint32_t width = 0;
     uint32_t height = 0;
 
-    std::vector<uint8_t> lastRgb;
+    std::vector<uint8_t> lastFrame;
     std::mutex frameMutex;
     std::atomic<bool> hasFrame{ false };
 
     bool bottomUp = false;
+    int outputMode = CDS_OUTPUT_BGRA;
+    DsFrameLayout frameLayout{};
 
     // ---- Button (edge triggered) ----
     std::atomic<bool> buttonEdge{ false };
@@ -582,22 +619,33 @@ HRESULT STDMETHODCALLTYPE StillButtonCB::SampleCB(double sampleTime, IMediaSampl
 HRESULT STDMETHODCALLTYPE FrameGrabberCB::BufferCB(double, BYTE* buffer, long len) {
     if (!_s || !buffer || len <= 0) return S_OK;
 
+    std::lock_guard<std::mutex> lk(_s->frameMutex);
+    const size_t sampleBytes = (size_t)len;
+
+    if (_s->outputMode == CDS_OUTPUT_NATIVE) {
+        if (!update_native_layout_from_sample_length(_s, sampleBytes)) return S_OK;
+        const size_t expected = _s->frameLayout.dataBytes;
+        if (expected == 0 || sampleBytes < expected) return S_OK;
+        _s->lastFrame.resize(expected);
+        memcpy(_s->lastFrame.data(), buffer, expected);
+        _s->hasFrame.store(true);
+        return S_OK;
+    }
+
     size_t rowBytes = 0;
     size_t expected = 0;
     if (!calc_frame_layout_bytes(_s->width, _s->height, rowBytes, expected)) return S_OK;
-    if (expected == 0 || (size_t)len < expected) return S_OK;
-
-    std::lock_guard<std::mutex> lk(_s->frameMutex);
-    _s->lastRgb.resize(expected);
+    if (expected == 0 || sampleBytes < expected) return S_OK;
+    _s->lastFrame.resize(expected);
 
     if (!_s->bottomUp) {
-        memcpy(_s->lastRgb.data(), buffer, expected);
+        memcpy(_s->lastFrame.data(), buffer, expected);
     }
     else {
         // Flip rows to guarantee top-down
         for (uint32_t y = 0; y < _s->height; ++y) {
             const uint8_t* srcRow = buffer + ((size_t)(_s->height - 1 - y) * rowBytes);
-            uint8_t* dstRow = _s->lastRgb.data() + ((size_t)y * rowBytes);
+            uint8_t* dstRow = _s->lastFrame.data() + ((size_t)y * rowBytes);
             memcpy(dstRow, srcRow, rowBytes);
         }
     }
@@ -681,6 +729,113 @@ static bool calc_frame_layout_bytes(uint32_t width, uint32_t height, size_t& row
     if ((size_t)height > (SIZE_MAX / rowBytes)) return false;
     totalBytes = rowBytes * (size_t)height;
     return true;
+}
+
+static const BITMAPINFOHEADER* media_type_bitmap_header(const AM_MEDIA_TYPE* mt) {
+    if (!mt || !mt->pbFormat) return nullptr;
+    if (mt->formattype == FORMAT_VideoInfo && mt->cbFormat >= sizeof(VIDEOINFOHEADER)) {
+        return &((const VIDEOINFOHEADER*)mt->pbFormat)->bmiHeader;
+    }
+    if (mt->formattype == FORMAT_VideoInfo2 && mt->cbFormat >= sizeof(VIDEOINFOHEADER2)) {
+        return &((const VIDEOINFOHEADER2*)mt->pbFormat)->bmiHeader;
+    }
+    return nullptr;
+}
+
+static bool calc_connected_frame_layout(
+    const AM_MEDIA_TYPE* mt,
+    uint32_t width,
+    uint32_t height,
+    DsFrameLayout& layout)
+{
+    layout = DsFrameLayout{};
+    if (!mt || width == 0 || height == 0) return false;
+
+    layout.pixelFormat = PixelFormatFromSubtype(mt->subtype);
+    const BITMAPINFOHEADER* bmi = media_type_bitmap_header(mt);
+    const size_t advertisedBytes = bmi ? (size_t)bmi->biSizeImage : 0;
+
+    if (layout.pixelFormat == CDS_PIXEL_FORMAT_BGRA) {
+        size_t rowBytes = 0;
+        size_t totalBytes = 0;
+        if (!calc_frame_layout_bytes(width, height, rowBytes, totalBytes)) return false;
+        layout.dataBytes = totalBytes;
+        layout.planeCount = 1;
+        layout.planeStrides[0] = rowBytes;
+        return true;
+    }
+
+    if (layout.pixelFormat == CDS_PIXEL_FORMAT_YUY2) {
+        if ((width & 1u) != 0 || (size_t)width > SIZE_MAX / 2u) return false;
+        const size_t minimumStride = (size_t)width * 2u;
+        size_t stride = minimumStride;
+        if (advertisedBytes >= minimumStride * (size_t)height &&
+            advertisedBytes % (size_t)height == 0) {
+            stride = advertisedBytes / (size_t)height;
+        }
+        if ((size_t)height > SIZE_MAX / stride) return false;
+        layout.dataBytes = stride * (size_t)height;
+        layout.planeCount = 1;
+        layout.planeStrides[0] = stride;
+        return true;
+    }
+
+    if (layout.pixelFormat == CDS_PIXEL_FORMAT_NV12) {
+        if ((width & 1u) != 0 || (height & 1u) != 0) return false;
+        const size_t chromaRows = ((size_t)height + 1u) / 2u;
+        const size_t totalRows = (size_t)height + chromaRows;
+        size_t stride = (size_t)width;
+        if (advertisedBytes >= stride * totalRows && advertisedBytes % totalRows == 0) {
+            stride = advertisedBytes / totalRows;
+        }
+        if (totalRows > SIZE_MAX / stride) return false;
+        layout.dataBytes = stride * totalRows;
+        layout.planeCount = 2;
+        layout.planeOffsets[1] = stride * (size_t)height;
+        layout.planeStrides[0] = stride;
+        layout.planeStrides[1] = stride;
+        return true;
+    }
+
+    return false;
+}
+
+static bool update_native_layout_from_sample_length(
+    DsSession* session,
+    size_t sampleBytes)
+{
+    if (!session || session->width == 0 || session->height == 0) return false;
+    DsFrameLayout& layout = session->frameLayout;
+
+    if (layout.pixelFormat == CDS_PIXEL_FORMAT_YUY2) {
+        const size_t height = (size_t)session->height;
+        const size_t minimumStride = (size_t)session->width * 2u;
+        if (sampleBytes % height != 0) return sampleBytes >= layout.dataBytes;
+        const size_t stride = sampleBytes / height;
+        if (stride < minimumStride) return false;
+        layout.dataBytes = sampleBytes;
+        layout.planeCount = 1;
+        layout.planeOffsets[0] = 0;
+        layout.planeStrides[0] = stride;
+        return true;
+    }
+
+    if (layout.pixelFormat == CDS_PIXEL_FORMAT_NV12) {
+        const size_t chromaRows = ((size_t)session->height + 1u) / 2u;
+        const size_t totalRows = (size_t)session->height + chromaRows;
+        if (sampleBytes % totalRows != 0) return sampleBytes >= layout.dataBytes;
+        const size_t stride = sampleBytes / totalRows;
+        if (stride < (size_t)session->width) return false;
+        layout.dataBytes = sampleBytes;
+        layout.planeCount = 2;
+        layout.planeOffsets[0] = 0;
+        layout.planeOffsets[1] = stride * (size_t)session->height;
+        layout.planeStrides[0] = stride;
+        layout.planeStrides[1] = stride;
+        return true;
+    }
+
+    return sampleBytes >= layout.dataBytes;
 }
 
 static HRESULT co_initialize_for_api_call(bool& didInit) {
@@ -1264,11 +1419,12 @@ static HRESULT build_still_fallback_button_branch(DsSession* s) {
     return S_OK;
 }
 
-// ---- Build capture graph: RGB32 guaranteed + detect bottom-up & flip ----
-static HRESULT build_capture_graph_rgb32(
+// ---- Build capture graph: BGRA compatibility output or direct native YUV ----
+static HRESULT build_capture_graph(
     DsSession* s,
     const DsDevice& dev,
-    uint32_t streamCapsIndex)
+    uint32_t streamCapsIndex,
+    int outputMode)
 {
     constexpr int kMaxStreamCapsBytes = 1024 * 1024;
 
@@ -1409,6 +1565,22 @@ static HRESULT build_capture_graph_rgb32(
     hr = cfg->GetStreamCaps((int)streamCapsIndex, &mt, capsBuf.data());
     if (FAILED(hr) || !mt) { SAFE_RELEASE(cfg); return E_FAIL; }
 
+    if (outputMode != CDS_OUTPUT_BGRA && outputMode != CDS_OUTPUT_NATIVE) {
+        free_am_media_type(mt);
+        SAFE_RELEASE(cfg);
+        return E_INVALIDARG;
+    }
+
+    const GUID selectedSubtype = mt->subtype;
+    if (outputMode == CDS_OUTPUT_NATIVE &&
+        selectedSubtype != MEDIASUBTYPE_NV12 &&
+        selectedSubtype != MEDIASUBTYPE_YUY2) {
+        free_am_media_type(mt);
+        SAFE_RELEASE(cfg);
+        return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    }
+    s->outputMode = outputMode;
+
     // GetStreamCaps can return a conservative default AvgTimePerFrame even
     // when the capability advertises a faster valid interval. Always request
     // the fastest rate for the explicitly selected capability.
@@ -1441,7 +1613,7 @@ static HRESULT build_capture_graph_rgb32(
     if (!s->width || !s->height) return E_FAIL;
 
     // -----------------------------
-    // SampleGrabber (RGB32)
+    // SampleGrabber (BGRA compatibility output or selected native subtype)
     // -----------------------------
     hr = CoCreateInstance(__uuidof(CLSID_SampleGrabber), nullptr, CLSCTX_INPROC_SERVER,
         IID_IBaseFilter, (void**)&s->grabberFilter);
@@ -1452,31 +1624,40 @@ static HRESULT build_capture_graph_rgb32(
     hr = s->grabberFilter->QueryInterface(__uuidof(ISampleGrabber), (void**)&s->grabber);
     if (FAILED(hr) || !s->grabber) return FAILED(hr) ? hr : E_FAIL;
 
-    VIDEOINFOHEADER vih{};
-    vih.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    vih.bmiHeader.biWidth = (LONG)s->width;
-    vih.bmiHeader.biHeight = -(LONG)s->height;
-    vih.bmiHeader.biPlanes = 1;
-    vih.bmiHeader.biBitCount = 32;
-    vih.bmiHeader.biCompression = BI_RGB;
     size_t rowBytes = 0;
     size_t frameBytes = 0;
-    if (!calc_frame_layout_bytes(s->width, s->height, rowBytes, frameBytes)) return E_FAIL;
-    if (rowBytes > (size_t)(std::numeric_limits<int32_t>::max)()) return E_FAIL;
-    if (frameBytes > (std::numeric_limits<DWORD>::max)()) return E_FAIL;
-    vih.bmiHeader.biSizeImage = (DWORD)frameBytes;
+    if (outputMode == CDS_OUTPUT_BGRA) {
+        VIDEOINFOHEADER vih{};
+        vih.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        vih.bmiHeader.biWidth = (LONG)s->width;
+        vih.bmiHeader.biHeight = -(LONG)s->height;
+        vih.bmiHeader.biPlanes = 1;
+        vih.bmiHeader.biBitCount = 32;
+        vih.bmiHeader.biCompression = BI_RGB;
+        if (!calc_frame_layout_bytes(s->width, s->height, rowBytes, frameBytes)) return E_FAIL;
+        if (rowBytes > (size_t)(std::numeric_limits<int32_t>::max)()) return E_FAIL;
+        if (frameBytes > (std::numeric_limits<DWORD>::max)()) return E_FAIL;
+        vih.bmiHeader.biSizeImage = (DWORD)frameBytes;
 
-    AM_MEDIA_TYPE rgb{};
-    rgb.majortype = MEDIATYPE_Video;
-    rgb.subtype = MEDIASUBTYPE_RGB32;
-    rgb.formattype = FORMAT_VideoInfo;
-    rgb.cbFormat = sizeof(VIDEOINFOHEADER);
-    rgb.pbFormat = (BYTE*)CoTaskMemAlloc(sizeof(VIDEOINFOHEADER));
-    if (!rgb.pbFormat) return E_OUTOFMEMORY;
-    memcpy(rgb.pbFormat, &vih, sizeof(VIDEOINFOHEADER));
+        AM_MEDIA_TYPE rgb{};
+        rgb.majortype = MEDIATYPE_Video;
+        rgb.subtype = MEDIASUBTYPE_RGB32;
+        rgb.formattype = FORMAT_VideoInfo;
+        rgb.cbFormat = sizeof(VIDEOINFOHEADER);
+        rgb.pbFormat = (BYTE*)CoTaskMemAlloc(sizeof(VIDEOINFOHEADER));
+        if (!rgb.pbFormat) return E_OUTOFMEMORY;
+        memcpy(rgb.pbFormat, &vih, sizeof(VIDEOINFOHEADER));
 
-    hr = s->grabber->SetMediaType(&rgb);
-    CoTaskMemFree(rgb.pbFormat);
+        hr = s->grabber->SetMediaType(&rgb);
+        CoTaskMemFree(rgb.pbFormat);
+    }
+    else {
+        AM_MEDIA_TYPE native{};
+        native.majortype = MEDIATYPE_Video;
+        native.subtype = selectedSubtype;
+        native.formattype = GUID_NULL;
+        hr = s->grabber->SetMediaType(&native);
+    }
     if (FAILED(hr)) return hr;
 
     hr = s->grabber->SetBufferSamples(FALSE);
@@ -1498,37 +1679,65 @@ static HRESULT build_capture_graph_rgb32(
 
     if (FAILED(hr)) return hr;
 
-    // Detect orientation from the connected media type.
-    // Positive biHeight means bottom-up RGB (needs row flip in BufferCB).
+    // Detect the actual connected subtype/layout. Positive biHeight only means
+    // bottom-up for RGB; YUV formats are copied in their native top-down layout.
     s->bottomUp = false;
     {
         AM_MEDIA_TYPE connected{};
         if (SUCCEEDED(s->grabber->GetConnectedMediaType(&connected))) {
+            uint32_t connectedWidth = s->width;
+            uint32_t connectedHeight = s->height;
+            (void)try_get_media_type_dimensions(&connected, connectedWidth, connectedHeight);
+            s->width = connectedWidth;
+            s->height = connectedHeight;
+
             REFERENCE_TIME connectedInterval = media_type_frame_interval(&connected);
             if (connectedInterval > 0) {
                 dbg_printf(
-                    "Connected RGB32 frame interval: %lld (%.3f fps)\n",
+                    "Connected frame interval: %lld (%.3f fps)\n",
                     (long long)connectedInterval,
                     10000000.0 / (double)connectedInterval);
             }
 
-            LONG ch = 0;
-            bool haveH = false;
-            if (connected.formattype == FORMAT_VideoInfo &&
-                connected.pbFormat &&
-                connected.cbFormat >= sizeof(VIDEOINFOHEADER)) {
-                auto cvih = reinterpret_cast<VIDEOINFOHEADER*>(connected.pbFormat);
-                ch = cvih->bmiHeader.biHeight;
-                haveH = true;
+            if (outputMode == CDS_OUTPUT_NATIVE && connected.subtype != selectedSubtype) {
+                if (connected.cbFormat && connected.pbFormat) CoTaskMemFree(connected.pbFormat);
+                if (connected.pUnk) connected.pUnk->Release();
+                return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
             }
-            if (haveH) {
-                s->bottomUp = (ch > 0);
-                dbg_printf("RGB orientation: biHeight=%ld -> bottomUp=%s\n",
-                    (long)ch, s->bottomUp ? "YES" : "NO");
+
+            if (!calc_connected_frame_layout(
+                    &connected,
+                    s->width,
+                    s->height,
+                    s->frameLayout)) {
+                if (connected.cbFormat && connected.pbFormat) CoTaskMemFree(connected.pbFormat);
+                if (connected.pUnk) connected.pUnk->Release();
+                return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
             }
+            frameBytes = s->frameLayout.dataBytes;
+            rowBytes = s->frameLayout.planeStrides[0];
+
+            if (s->frameLayout.pixelFormat == CDS_PIXEL_FORMAT_BGRA) {
+                const BITMAPINFOHEADER* bmi = media_type_bitmap_header(&connected);
+                if (bmi) {
+                    s->bottomUp = bmi->biHeight > 0;
+                    dbg_printf("RGB orientation: biHeight=%ld -> bottomUp=%s\n",
+                        (long)bmi->biHeight, s->bottomUp ? "YES" : "NO");
+                }
+            }
+            dbg_printf(
+                "Connected output: %s bytes=%zu stride0=%zu offset1=%zu stride1=%zu\n",
+                PixelFormatName(s->frameLayout.pixelFormat),
+                s->frameLayout.dataBytes,
+                s->frameLayout.planeStrides[0],
+                s->frameLayout.planeOffsets[1],
+                s->frameLayout.planeStrides[1]);
 
             if (connected.cbFormat && connected.pbFormat) CoTaskMemFree(connected.pbFormat);
             if (connected.pUnk) connected.pUnk->Release();
+        }
+        else {
+            return E_FAIL;
         }
     }
 
@@ -1550,12 +1759,16 @@ static HRESULT build_capture_graph_rgb32(
     if (FAILED(hr) || !s->mc) return FAILED(hr) ? hr : E_FAIL;
     s->graph->QueryInterface(IID_IMediaEvent, (void**)&s->me);
 
-    s->lastRgb.resize(frameBytes);
+    s->lastFrame.resize(frameBytes);
 
     return S_OK;
 }
 
-static void session_thread_main(DsSession* s, DsDevice devCopy, uint32_t streamCapsIndex) {
+static void session_thread_main(
+    DsSession* s,
+    DsDevice devCopy,
+    uint32_t streamCapsIndex,
+    int outputMode) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     auto signal_start = [&](cds_result_t r) {
@@ -1569,7 +1782,7 @@ static void session_thread_main(DsSession* s, DsDevice devCopy, uint32_t streamC
         s->startCv.notify_all();
     };
 
-    HRESULT hr = build_capture_graph_rgb32(s, devCopy, streamCapsIndex);
+    HRESULT hr = build_capture_graph(s, devCopy, streamCapsIndex, outputMode);
     if (SUCCEEDED(hr)) {
         if (!s->mc) {
             signal_start(CDS_ERR_OPENING_DEVICE);
@@ -1639,7 +1852,11 @@ static void session_thread_main(DsSession* s, DsDevice devCopy, uint32_t streamC
         }
     }
     else {
-        signal_start(CDS_ERR_OPENING_DEVICE);
+        const cds_result_t buildResult =
+            hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)
+                ? CDS_ERR_FORMAT_NOT_SUPPORTED
+                : (hr == E_INVALIDARG ? CDS_ERR_INVALID_ARGUMENT : CDS_ERR_OPENING_DEVICE);
+        signal_start(buildResult);
         dbg_printf("cds: build graph failed: %s\n", HResultToString(hr).c_str());
     }
 
@@ -1864,6 +2081,19 @@ extern "C" {
     }
 
     SP_API cds_result_t SP_CALL cds_start_capture(uint32_t device_index, uint32_t width, uint32_t height) {
+        return cds_start_capture_with_output(device_index, width, height, CDS_OUTPUT_BGRA);
+    }
+
+    SP_API cds_result_t SP_CALL cds_start_capture_with_output(
+        uint32_t device_index,
+        uint32_t width,
+        uint32_t height,
+        int32_t output_mode)
+    {
+        if (output_mode != CDS_OUTPUT_BGRA && output_mode != CDS_OUTPUT_NATIVE) {
+            return CDS_ERR_INVALID_ARGUMENT;
+        }
+
         std::vector<uint32_t> rankedFormatIndices;
         {
             std::lock_guard<std::mutex> lk(g_dsMutex);
@@ -1911,14 +2141,18 @@ extern "C" {
 
         cds_result_t lastResult = CDS_ERR_OPENING_DEVICE;
         for (uint32_t formatIndex : rankedFormatIndices) {
-            lastResult = cds_start_capture_with_format(device_index, formatIndex);
+            lastResult = cds_start_capture_with_format_output(
+                device_index,
+                formatIndex,
+                output_mode);
             if (lastResult == CDS_OK) {
                 dbg_printf(
                     "Resolution-only selection succeeded with format index=%u\n",
                     formatIndex);
                 return CDS_OK;
             }
-            if (lastResult != CDS_ERR_OPENING_DEVICE) {
+            if (lastResult != CDS_ERR_OPENING_DEVICE &&
+                lastResult != CDS_ERR_FORMAT_NOT_SUPPORTED) {
                 return lastResult;
             }
             dbg_printf(
@@ -1929,6 +2163,21 @@ extern "C" {
     }
 
     SP_API cds_result_t SP_CALL cds_start_capture_with_format(uint32_t device_index, uint32_t format_index) {
+        return cds_start_capture_with_format_output(
+            device_index,
+            format_index,
+            CDS_OUTPUT_BGRA);
+    }
+
+    SP_API cds_result_t SP_CALL cds_start_capture_with_format_output(
+        uint32_t device_index,
+        uint32_t format_index,
+        int32_t output_mode)
+    {
+        if (output_mode != CDS_OUTPUT_BGRA && output_mode != CDS_OUTPUT_NATIVE) {
+            return CDS_ERR_INVALID_ARGUMENT;
+        }
+
         DsDevice devCopy;
         uint32_t streamCapsIndex = 0;
         uint64_t generationSnapshot = 0;
@@ -1942,6 +2191,12 @@ extern "C" {
 
             generationSnapshot = g_dsGeneration;
             devCopy = g_dsDevices[device_index];
+            if (output_mode == CDS_OUTPUT_NATIVE) {
+                const GUID& subtype = g_dsDevices[device_index].formats[format_index].subtype;
+                if (subtype != MEDIASUBTYPE_NV12 && subtype != MEDIASUBTYPE_YUY2) {
+                    return CDS_ERR_FORMAT_NOT_SUPPORTED;
+                }
+            }
             streamCapsIndex = g_dsDevices[device_index].formats[format_index].streamCapsIndex;
         }
 
@@ -1950,7 +2205,12 @@ extern "C" {
 
         s->stopRequested.store(false);
         try {
-            s->worker = std::thread(session_thread_main, s, devCopy, streamCapsIndex);
+            s->worker = std::thread(
+                session_thread_main,
+                s,
+                devCopy,
+                streamCapsIndex,
+                output_mode);
         }
         catch (...) {
             delete s;
@@ -2026,16 +2286,12 @@ extern "C" {
 
         if (!buffer) return CDS_ERR_BUF_NULL;
 
-        size_t rowBytes = 0;
-        size_t needed = 0;
-        if (!calc_frame_layout_bytes(s->width, s->height, rowBytes, needed)) return CDS_ERR_READ_FRAME;
-        if (rowBytes > (size_t)(std::numeric_limits<int32_t>::max)()) return CDS_ERR_READ_FRAME;
-        if (available_bytes < needed) return CDS_ERR_BUF_TOO_SMALL;
-
         std::lock_guard<std::mutex> lk2(s->frameMutex);
-        if (!s->hasFrame.load() || s->lastRgb.size() < needed) return CDS_ERR_READ_FRAME;
+        const size_t needed = s->frameLayout.dataBytes;
+        if (needed == 0 || available_bytes < needed) return CDS_ERR_BUF_TOO_SMALL;
+        if (!s->hasFrame.load() || s->lastFrame.size() < needed) return CDS_ERR_READ_FRAME;
 
-        memcpy(buffer, s->lastRgb.data(), needed);
+        memcpy(buffer, s->lastFrame.data(), needed);
         return CDS_OK;
     }
 
@@ -2057,7 +2313,73 @@ extern "C" {
         std::lock_guard<std::mutex> lk(g_dsMutex);
         auto it = g_dsSessions.find(device_index);
         if (it == g_dsSessions.end()) return 0;
-        return (int32_t)it->second->width * 4;
+        std::lock_guard<std::mutex> lk2(it->second->frameMutex);
+        const size_t stride = it->second->frameLayout.planeStrides[0];
+        return stride <= (size_t)(std::numeric_limits<int32_t>::max)()
+            ? (int32_t)stride
+            : 0;
+    }
+
+    SP_API int32_t SP_CALL cds_frame_data_size(uint32_t device_index) {
+        std::lock_guard<std::mutex> lk(g_dsMutex);
+        auto it = g_dsSessions.find(device_index);
+        if (it == g_dsSessions.end()) return 0;
+        std::lock_guard<std::mutex> lk2(it->second->frameMutex);
+        const size_t bytes = it->second->frameLayout.dataBytes;
+        return bytes <= (size_t)(std::numeric_limits<int32_t>::max)()
+            ? (int32_t)bytes
+            : 0;
+    }
+
+    SP_API int32_t SP_CALL cds_frame_pixel_format(uint32_t device_index) {
+        std::lock_guard<std::mutex> lk(g_dsMutex);
+        auto it = g_dsSessions.find(device_index);
+        if (it == g_dsSessions.end()) return CDS_PIXEL_FORMAT_UNKNOWN;
+        std::lock_guard<std::mutex> lk2(it->second->frameMutex);
+        return it->second->frameLayout.pixelFormat;
+    }
+
+    SP_API size_t SP_CALL cds_frame_pixel_format_name(
+        uint32_t device_index,
+        char* buf,
+        size_t buf_len)
+    {
+        return copy_str(PixelFormatName(cds_frame_pixel_format(device_index)), buf, buf_len);
+    }
+
+    SP_API int32_t SP_CALL cds_frame_plane_count(uint32_t device_index) {
+        std::lock_guard<std::mutex> lk(g_dsMutex);
+        auto it = g_dsSessions.find(device_index);
+        if (it == g_dsSessions.end()) return 0;
+        std::lock_guard<std::mutex> lk2(it->second->frameMutex);
+        return it->second->frameLayout.planeCount;
+    }
+
+    SP_API int32_t SP_CALL cds_frame_plane_offset(uint32_t device_index, int32_t plane_index) {
+        std::lock_guard<std::mutex> lk(g_dsMutex);
+        auto it = g_dsSessions.find(device_index);
+        if (it == g_dsSessions.end()) return -1;
+        std::lock_guard<std::mutex> lk2(it->second->frameMutex);
+        if (plane_index < 0 || plane_index >= it->second->frameLayout.planeCount) return -1;
+        const size_t offset = it->second->frameLayout.planeOffsets[plane_index];
+        return offset <= (size_t)(std::numeric_limits<int32_t>::max)()
+            ? (int32_t)offset
+            : -1;
+    }
+
+    SP_API int32_t SP_CALL cds_frame_plane_bytes_per_row(
+        uint32_t device_index,
+        int32_t plane_index)
+    {
+        std::lock_guard<std::mutex> lk(g_dsMutex);
+        auto it = g_dsSessions.find(device_index);
+        if (it == g_dsSessions.end()) return 0;
+        std::lock_guard<std::mutex> lk2(it->second->frameMutex);
+        if (plane_index < 0 || plane_index >= it->second->frameLayout.planeCount) return 0;
+        const size_t stride = it->second->frameLayout.planeStrides[plane_index];
+        return stride <= (size_t)(std::numeric_limits<int32_t>::max)()
+            ? (int32_t)stride
+            : 0;
     }
 
     SP_API cds_result_t SP_CALL cds_get_video_proc_amp_range(
