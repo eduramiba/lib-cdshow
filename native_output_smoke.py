@@ -2,6 +2,7 @@ import argparse
 import ctypes
 import os
 import sys
+import threading
 import time
 
 
@@ -11,6 +12,14 @@ CDS_OUTPUT_NATIVE = 1
 CDS_PIXEL_FORMAT_BGRA = 1
 CDS_PIXEL_FORMAT_NV12 = 2
 CDS_PIXEL_FORMAT_YUY2 = 3
+FRAME_CALLBACK = ctypes.WINFUNCTYPE(
+    None,
+    ctypes.c_uint32,
+    ctypes.POINTER(ctypes.c_uint8),
+    ctypes.c_size_t,
+    ctypes.c_int32,
+    ctypes.c_void_p,
+)
 
 
 def configure(dll):
@@ -49,6 +58,13 @@ def configure(dll):
         ctypes.c_uint32,
         ctypes.POINTER(ctypes.c_uint8),
         ctypes.c_size_t,
+    ]
+    dll.cds_set_frame_callback.restype = ctypes.c_int32
+    dll.cds_set_frame_callback.argtypes = [
+        ctypes.c_uint32,
+        FRAME_CALLBACK,
+        ctypes.c_void_p,
+        ctypes.c_int32,
     ]
 
 
@@ -168,11 +184,44 @@ def main():
         assert result == CDS_OK, f"Native start returned {result}"
         try:
             wait_for_frame(dll, device_index, args.timeout)
+            callback_event = threading.Event()
+            callback_frames = 0
+            callback_bytes = 0
+
+            @FRAME_CALLBACK
+            def on_frame(callback_device, data, data_size, bottom_up, _user_data):
+                nonlocal callback_frames, callback_bytes
+                assert callback_device == device_index
+                assert bool(data)
+                assert data_size > 0
+                assert bottom_up == 0
+                callback_frames += 1
+                callback_bytes += data_size
+                if callback_frames >= 5:
+                    callback_event.set()
+
+            callback_result = dll.cds_set_frame_callback(
+                device_index,
+                on_frame,
+                None,
+                1,
+            )
+            assert callback_result == CDS_OK
+            assert callback_event.wait(args.timeout), "Timed out waiting for callback frames"
             native_layout = assert_layout_and_grab(
                 dll,
                 device_index,
                 expected_native,
             )
+            assert callback_frames >= 5
+            assert callback_bytes >= callback_frames * native_layout["data_size"]
+            assert dll.cds_set_frame_callback(
+                device_index,
+                FRAME_CALLBACK(),
+                None,
+                0,
+            ) == CDS_OK
+            native_layout["callback_frames"] = callback_frames
         finally:
             dll.cds_stop_capture(device_index)
 

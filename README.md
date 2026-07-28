@@ -50,6 +50,25 @@ packed `Y0 U Y1 V` plane. `cds_grab_frame` copies exactly
 Run `python native_output_smoke.py` with a connected camera to verify direct
 YUV capture and the BGRA fallback on the same enumerated mode.
 
+## Push delivery without the continuous pull copy
+
+`cds_set_frame_callback` optionally delivers each connected DirectShow sample
+as it arrives. The callback receives the device index, actual frame size,
+bottom-up flag, and the user pointer registered by the caller. Its sample
+pointer is borrowed and valid only until the callback returns.
+
+With `exclusive != 0`, the library no longer copies every frame into its
+internal `lastFrame` vector. This is intended for consumers with their own
+bounded ring buffer. An explicit `cds_grab_frame` still works in exclusive mode:
+it requests the next sample and makes the internal copy only for that call.
+
+Unregister the callback before destroying its user data. Unregistration waits
+for an already-running callback to finish. Callback code must stay short and
+must not call capture stop or shutdown functions.
+
+`native_output_smoke.py` also exercises exclusive callback delivery,
+on-demand RGB capture, callback removal, and shutdown against a real camera.
+
 ## Camera controls
 
 The C API now exposes DirectShow camera controls through these functions:

@@ -45,6 +45,22 @@ extern "C" {
 #define CDS_PIXEL_FORMAT_NV12    2
 #define CDS_PIXEL_FORMAT_YUY2    3
 
+	// Optional push delivery. The frame pointer is owned by DirectShow and is
+	// valid only for the duration of the callback. The callback must copy or
+	// consume it immediately and must not call stop/shutdown functions.
+	//
+	// bottom_up is non-zero only for bottom-up RGB frames. Native NV12/YUY2 is
+	// delivered top-down. When exclusive is non-zero, the callback replaces
+	// the continuous internal pull-frame copy until it is unregistered.
+	// cds_grab_frame() remains available and waits for the next frame, retaining
+	// a pull copy only for that explicit request.
+	typedef void (SP_CALL *cds_frame_callback_t)(
+		uint32_t device_index,
+		const uint8_t* data,
+		size_t data_size,
+		int32_t bottom_up,
+		void* user_data);
+
 	// Camera control property IDs match DirectShow's VideoProcAmpProperty /
 	// CameraControlProperty values so callers do not need Windows headers.
 #define CDS_CONTROL_FLAG_AUTO    0x0001
@@ -122,6 +138,11 @@ extern "C" {
 
 	SP_API int32_t      SP_CALL cds_has_first_frame(uint32_t device_index);
 	SP_API cds_result_t SP_CALL cds_grab_frame(uint32_t device_index, uint8_t* buffer, size_t available_bytes);
+	SP_API cds_result_t SP_CALL cds_set_frame_callback(
+		uint32_t device_index,
+		cds_frame_callback_t callback,
+		void* user_data,
+		int32_t exclusive);
 
 	SP_API int32_t SP_CALL cds_frame_width(uint32_t device_index);
 	SP_API int32_t SP_CALL cds_frame_height(uint32_t device_index);

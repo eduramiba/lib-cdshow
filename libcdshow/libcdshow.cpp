@@ -520,12 +520,24 @@ private:
 };
 
 struct DsSession {
+    uint32_t deviceIndex = 0;
     uint32_t width = 0;
     uint32_t height = 0;
 
     std::vector<uint8_t> lastFrame;
     std::mutex frameMutex;
+    std::condition_variable frameCv;
     std::atomic<bool> hasFrame{ false };
+    std::atomic<bool> pullFrameValid{ false };
+    std::atomic<bool> pullFrameRequested{ false };
+    uint64_t pullFrameSequence = 0;
+
+    std::mutex deliveryMutex;
+    std::condition_variable deliveryCv;
+    cds_frame_callback_t frameCallback = nullptr;
+    void* frameCallbackUserData = nullptr;
+    bool frameCallbackExclusive = false;
+    uint32_t activeFrameCallbacks = 0;
 
     bool bottomUp = false;
     int outputMode = CDS_OUTPUT_BGRA;
@@ -619,38 +631,76 @@ HRESULT STDMETHODCALLTYPE StillButtonCB::SampleCB(double sampleTime, IMediaSampl
 HRESULT STDMETHODCALLTYPE FrameGrabberCB::BufferCB(double, BYTE* buffer, long len) {
     if (!_s || !buffer || len <= 0) return S_OK;
 
-    std::lock_guard<std::mutex> lk(_s->frameMutex);
     const size_t sampleBytes = (size_t)len;
-
-    if (_s->outputMode == CDS_OUTPUT_NATIVE) {
-        if (!update_native_layout_from_sample_length(_s, sampleBytes)) return S_OK;
-        const size_t expected = _s->frameLayout.dataBytes;
-        if (expected == 0 || sampleBytes < expected) return S_OK;
-        _s->lastFrame.resize(expected);
-        memcpy(_s->lastFrame.data(), buffer, expected);
-        _s->hasFrame.store(true);
-        return S_OK;
-    }
-
-    size_t rowBytes = 0;
     size_t expected = 0;
-    if (!calc_frame_layout_bytes(_s->width, _s->height, rowBytes, expected)) return S_OK;
-    if (expected == 0 || sampleBytes < expected) return S_OK;
-    _s->lastFrame.resize(expected);
+    bool bottomUp = false;
 
-    if (!_s->bottomUp) {
-        memcpy(_s->lastFrame.data(), buffer, expected);
+    {
+        std::lock_guard<std::mutex> lk(_s->frameMutex);
+        if (_s->outputMode == CDS_OUTPUT_NATIVE) {
+            if (!update_native_layout_from_sample_length(_s, sampleBytes)) return S_OK;
+            expected = _s->frameLayout.dataBytes;
+        }
+        else {
+            size_t rowBytes = 0;
+            if (!calc_frame_layout_bytes(_s->width, _s->height, rowBytes, expected)) return S_OK;
+            bottomUp = _s->bottomUp;
+        }
     }
-    else {
-        // Flip rows to guarantee top-down
-        for (uint32_t y = 0; y < _s->height; ++y) {
-            const uint8_t* srcRow = buffer + ((size_t)(_s->height - 1 - y) * rowBytes);
-            uint8_t* dstRow = _s->lastFrame.data() + ((size_t)y * rowBytes);
-            memcpy(dstRow, srcRow, rowBytes);
+    if (expected == 0 || sampleBytes < expected) return S_OK;
+
+    cds_frame_callback_t callback = nullptr;
+    void* callbackUserData = nullptr;
+    bool callbackExclusive = false;
+    {
+        std::lock_guard<std::mutex> lk(_s->deliveryMutex);
+        callback = _s->frameCallback;
+        callbackUserData = _s->frameCallbackUserData;
+        callbackExclusive = callback && _s->frameCallbackExclusive;
+        if (callback) {
+            ++_s->activeFrameCallbacks;
         }
     }
 
-    _s->hasFrame.store(true);
+    if (callback) {
+        callback(
+            _s->deviceIndex,
+            buffer,
+            expected,
+            bottomUp ? 1 : 0,
+            callbackUserData);
+        {
+            std::lock_guard<std::mutex> lk(_s->deliveryMutex);
+            if (_s->activeFrameCallbacks > 0) {
+                --_s->activeFrameCallbacks;
+            }
+        }
+        _s->deliveryCv.notify_all();
+    }
+
+    const bool copyForPull =
+        !callbackExclusive ||
+        _s->pullFrameRequested.exchange(false, std::memory_order_acq_rel);
+    if (copyForPull) {
+        std::lock_guard<std::mutex> lk(_s->frameMutex);
+        _s->lastFrame.resize(expected);
+        if (!bottomUp) {
+            memcpy(_s->lastFrame.data(), buffer, expected);
+        }
+        else {
+            const size_t rowBytes = _s->frameLayout.planeStrides[0];
+            for (uint32_t y = 0; y < _s->height; ++y) {
+                const uint8_t* srcRow = buffer + ((size_t)(_s->height - 1 - y) * rowBytes);
+                uint8_t* dstRow = _s->lastFrame.data() + ((size_t)y * rowBytes);
+                memcpy(dstRow, srcRow, rowBytes);
+            }
+        }
+        ++_s->pullFrameSequence;
+        _s->pullFrameValid.store(true, std::memory_order_release);
+        _s->frameCv.notify_all();
+    }
+
+    _s->hasFrame.store(true, std::memory_order_release);
     return S_OK;
 }
 
@@ -2203,6 +2253,7 @@ extern "C" {
         DsSession* s = new(std::nothrow) DsSession();
         if (!s) return CDS_ERR_UNKNOWN;
 
+        s->deviceIndex = device_index;
         s->stopRequested.store(false);
         try {
             s->worker = std::thread(
@@ -2286,12 +2337,71 @@ extern "C" {
 
         if (!buffer) return CDS_ERR_BUF_NULL;
 
-        std::lock_guard<std::mutex> lk2(s->frameMutex);
+        bool callbackExclusive = false;
+        {
+            std::lock_guard<std::mutex> deliveryLock(s->deliveryMutex);
+            callbackExclusive = s->frameCallback && s->frameCallbackExclusive;
+        }
+
+        std::unique_lock<std::mutex> lk2(s->frameMutex);
         const size_t needed = s->frameLayout.dataBytes;
         if (needed == 0 || available_bytes < needed) return CDS_ERR_BUF_TOO_SMALL;
-        if (!s->hasFrame.load() || s->lastFrame.size() < needed) return CDS_ERR_READ_FRAME;
+
+        if (callbackExclusive) {
+            const uint64_t previousSequence = s->pullFrameSequence;
+            s->pullFrameRequested.store(true, std::memory_order_release);
+            const bool received = s->frameCv.wait_for(
+                lk2,
+                std::chrono::milliseconds(1000),
+                [&]() {
+                    return s->pullFrameSequence > previousSequence ||
+                        s->stopRequested.load(std::memory_order_acquire);
+                });
+            if (!received || s->pullFrameSequence <= previousSequence) {
+                return CDS_ERR_READ_FRAME;
+            }
+        }
+
+        if (!s->pullFrameValid.load(std::memory_order_acquire) || s->lastFrame.size() < needed) {
+            return CDS_ERR_READ_FRAME;
+        }
 
         memcpy(buffer, s->lastFrame.data(), needed);
+        return CDS_OK;
+    }
+
+    SP_API cds_result_t SP_CALL cds_set_frame_callback(
+        uint32_t device_index,
+        cds_frame_callback_t callback,
+        void* user_data,
+        int32_t exclusive)
+    {
+        std::lock_guard<std::mutex> sessionLock(g_dsMutex);
+        auto it = g_dsSessions.find(device_index);
+        if (it == g_dsSessions.end()) return CDS_ERR_NOT_STARTED;
+        DsSession* s = it->second;
+
+        std::unique_lock<std::mutex> deliveryLock(s->deliveryMutex);
+        s->frameCallback = nullptr;
+        s->frameCallbackUserData = nullptr;
+        s->frameCallbackExclusive = false;
+        s->deliveryCv.wait(deliveryLock, [&]() {
+            return s->activeFrameCallbacks == 0;
+        });
+
+        if (callback) {
+            s->frameCallbackUserData = user_data;
+            s->frameCallbackExclusive = exclusive != 0;
+            s->frameCallback = callback;
+            if (s->frameCallbackExclusive) {
+                s->pullFrameValid.store(false, std::memory_order_release);
+                s->pullFrameRequested.store(false, std::memory_order_release);
+            }
+        }
+        else {
+            s->pullFrameValid.store(false, std::memory_order_release);
+            s->pullFrameRequested.store(false, std::memory_order_release);
+        }
         return CDS_OK;
     }
 
