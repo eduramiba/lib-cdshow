@@ -57,6 +57,8 @@ extern "C" {
 #define CDS_CAMERA_CONTROL_IRIS                  5
 #define CDS_CAMERA_CONTROL_FOCUS                 6
 
+	// Returns CDS_OK when DirectShow initializes successfully, including when
+	// zero video devices are currently connected (cds_devices_count returns 0).
 	SP_API cds_result_t SP_CALL cds_initialize(void);
 	SP_API void         SP_CALL cds_shutdown_capture_api(void);
 	SP_API void         SP_CALL cds_set_log_enabled(int32_t enabled); // 0=off, non-zero=on

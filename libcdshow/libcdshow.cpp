@@ -904,7 +904,10 @@ static HRESULT enumerate_devices_and_formats() {
 
     hr = devEnum->CreateClassEnumerator(CLSID_VideoInputDeviceCategory, &enumMon, 0);
     devEnum->Release();
-    if (hr != S_OK) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    // DirectShow returns S_FALSE when the category exists but currently has no
+    // devices. That is a valid empty enumeration, not an initialization error.
+    if (hr == S_FALSE) return S_OK;
+    if (FAILED(hr)) return hr;
 
     IMoniker* mk = nullptr; ULONG fetched = 0;
     while (enumMon->Next(1, &mk, &fetched) == S_OK) {
