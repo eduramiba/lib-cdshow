@@ -6,6 +6,22 @@ This was built to be used with JNA in https://github.com/eduramiba/webcam-captur
 
 Note: this library has been mostly coded with OpenAI Codex
 
+## Automatic capture-format selection
+
+`cds_start_capture(device, width, height)` selects among native camera modes at
+the requested resolution using this policy:
+
+1. Highest advertised frame rate.
+2. Lowest expected conversion/decode cost to the library's RGB32 output:
+   RGB32, RGB24, NV12, YUY2, MJPG, ARGB32, then unknown subtypes.
+3. Lowest stable format index when the scores are otherwise identical.
+
+The selected capability is explicitly configured with its fastest advertised
+frame interval. If DirectShow cannot build or run that candidate's RGB32 graph,
+resolution-only start tries the next ranked mode at the same resolution. Call
+`cds_start_capture_with_format` when the caller needs an exact enumerated mode
+without automatic fallback.
+
 ## Camera controls
 
 The C API now exposes DirectShow camera controls through these functions:

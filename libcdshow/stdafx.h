@@ -5,6 +5,10 @@
 
 #pragma once
 
+#ifndef _WIN32_DCOM
+#define _WIN32_DCOM
+#endif
+
 #include "targetver.h"
 
 #include <stdio.h>

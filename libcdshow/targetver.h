@@ -1,10 +1,7 @@
 #pragma once
 
-// Including SDKDDKVer.h defines the highest available Windows platform.
-
-// If you wish to build your application for a previous Windows platform, include WinSDKVer.h and
-// set the _WIN32_WINNT macro to the platform you wish to support before including SDKDDKVer.h.
-
-#include <SDKDDKVer.h>
-
+// Target Windows 7 and newer. The version must be selected before SDKDDKVer.h
+// applies its defaults, otherwise the SDK defines a newer value first.
+#include <WinSDKVer.h>
 #define _WIN32_WINNT _WIN32_WINNT_WIN7
+#include <SDKDDKVer.h>

@@ -85,6 +85,10 @@ extern "C" {
 	SP_API size_t   SP_CALL cds_device_format_type(int32_t device_index, int32_t format_index, char* buf, size_t buf_len);
 
 	// Capture (RGB32 guaranteed, top-down guaranteed)
+	// Resolution-only start chooses the highest advertised FPS first, then the
+	// lowest expected conversion/decode cost, and falls back when DirectShow
+	// cannot build/run a candidate. Exact-format start bypasses selection and
+	// fallback. Both request the selected capability's maximum FPS.
 	SP_API cds_result_t SP_CALL cds_start_capture(uint32_t device_index, uint32_t width, uint32_t height);
 	SP_API cds_result_t SP_CALL cds_start_capture_with_format(uint32_t device_index, uint32_t format_index);
 	SP_API cds_result_t SP_CALL cds_stop_capture(uint32_t device_index);

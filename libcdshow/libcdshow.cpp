@@ -1,11 +1,12 @@
-#define _WIN32_DCOM
 #include "stdafx.h"
 #include "libcdshow.h"
+#include "format_selection.h"
 
 #pragma comment(lib, "strmiids.lib")
 
 #include <windows.h>
 #include <dshow.h>
+#include <dvdmedia.h>
 #include <strmif.h>
 #include <comutil.h>
 #include <comdef.h>
@@ -121,6 +122,17 @@ static const char* SubTypeName(const GUID& st) {
     if (st == MEDIASUBTYPE_RGB32) return "RGB32";
     if (st == MEDIASUBTYPE_ARGB32) return "ARGB32";
     return nullptr;
+}
+
+static int SubTypeProcessingRank(const GUID& st) {
+    using namespace cds_format_selection;
+    if (st == MEDIASUBTYPE_RGB32) return PROCESSING_RGB32;
+    if (st == MEDIASUBTYPE_RGB24) return PROCESSING_RGB24;
+    if (st == MEDIASUBTYPE_NV12) return PROCESSING_NV12;
+    if (st == MEDIASUBTYPE_YUY2) return PROCESSING_YUY2;
+    if (st == MEDIASUBTYPE_MJPG) return PROCESSING_MJPG;
+    if (st == MEDIASUBTYPE_ARGB32) return PROCESSING_ARGB32;
+    return PROCESSING_UNKNOWN;
 }
 
 static std::string HResultToString(HRESULT hr) {
@@ -612,6 +624,56 @@ static bool try_get_vih_dimensions(const VIDEOINFOHEADER* vih, uint32_t& width, 
     return true;
 }
 
+static bool try_get_vih2_dimensions(const VIDEOINFOHEADER2* vih, uint32_t& width, uint32_t& height) {
+    if (!vih) return false;
+    LONG w = vih->bmiHeader.biWidth;
+    LONG h = vih->bmiHeader.biHeight;
+    if (w <= 0 || h == 0 || h == (std::numeric_limits<LONG>::min)()) return false;
+
+    width = (uint32_t)w;
+    height = (uint32_t)(h < 0 ? -h : h);
+    return true;
+}
+
+static bool try_get_media_type_dimensions(
+    const AM_MEDIA_TYPE* mt,
+    uint32_t& width,
+    uint32_t& height)
+{
+    if (!mt || !mt->pbFormat) return false;
+    if (mt->formattype == FORMAT_VideoInfo && mt->cbFormat >= sizeof(VIDEOINFOHEADER)) {
+        return try_get_vih_dimensions((const VIDEOINFOHEADER*)mt->pbFormat, width, height);
+    }
+    if (mt->formattype == FORMAT_VideoInfo2 && mt->cbFormat >= sizeof(VIDEOINFOHEADER2)) {
+        return try_get_vih2_dimensions((const VIDEOINFOHEADER2*)mt->pbFormat, width, height);
+    }
+    return false;
+}
+
+static REFERENCE_TIME media_type_frame_interval(const AM_MEDIA_TYPE* mt) {
+    if (!mt || !mt->pbFormat) return 0;
+    if (mt->formattype == FORMAT_VideoInfo && mt->cbFormat >= sizeof(VIDEOINFOHEADER)) {
+        return ((const VIDEOINFOHEADER*)mt->pbFormat)->AvgTimePerFrame;
+    }
+    if (mt->formattype == FORMAT_VideoInfo2 && mt->cbFormat >= sizeof(VIDEOINFOHEADER2)) {
+        return ((const VIDEOINFOHEADER2*)mt->pbFormat)->AvgTimePerFrame;
+    }
+    return 0;
+}
+
+static bool set_media_type_frame_interval(AM_MEDIA_TYPE* mt, REFERENCE_TIME interval) {
+    if (!mt || !mt->pbFormat || interval <= 0) return false;
+    if (mt->formattype == FORMAT_VideoInfo && mt->cbFormat >= sizeof(VIDEOINFOHEADER)) {
+        ((VIDEOINFOHEADER*)mt->pbFormat)->AvgTimePerFrame = interval;
+        return true;
+    }
+    if (mt->formattype == FORMAT_VideoInfo2 && mt->cbFormat >= sizeof(VIDEOINFOHEADER2)) {
+        ((VIDEOINFOHEADER2*)mt->pbFormat)->AvgTimePerFrame = interval;
+        return true;
+    }
+    return false;
+}
+
 static bool calc_frame_layout_bytes(uint32_t width, uint32_t height, size_t& rowBytes, size_t& totalBytes) {
     if (width == 0 || height == 0) return false;
     if ((size_t)width > (SIZE_MAX / 4)) return false;
@@ -992,22 +1054,19 @@ static HRESULT enumerate_devices_and_formats() {
                                 VIDEO_STREAM_CONFIG_CAPS* caps = (VIDEO_STREAM_CONFIG_CAPS*)capsBuf.data();
 
                                 uint32_t w = 0, h = 0;
-                                if (mt->formattype == FORMAT_VideoInfo && mt->pbFormat && mt->cbFormat >= sizeof(VIDEOINFOHEADER)) {
-                                    auto vih = (VIDEOINFOHEADER*)mt->pbFormat;
-                                    if (!try_get_vih_dimensions(vih, w, h)) {
-                                        free_am_media_type(mt);
-                                        continue;
-                                    }
+                                if (!try_get_media_type_dimensions(mt, w, h)) {
+                                    free_am_media_type(mt);
+                                    continue;
                                 }
 
                                 uint32_t maxFps = 0;
                                 if (caps->MinFrameInterval > 0) {
                                     maxFps = (uint32_t)(10000000ULL / (uint64_t)caps->MinFrameInterval);
                                 }
-                                else if (mt->formattype == FORMAT_VideoInfo && mt->pbFormat && mt->cbFormat >= sizeof(VIDEOINFOHEADER)) {
-                                    auto vih = (VIDEOINFOHEADER*)mt->pbFormat;
-                                    if (vih->AvgTimePerFrame > 0)
-                                        maxFps = (uint32_t)(10000000ULL / (uint64_t)vih->AvgTimePerFrame);
+                                else {
+                                    REFERENCE_TIME interval = media_type_frame_interval(mt);
+                                    if (interval > 0)
+                                        maxFps = (uint32_t)(10000000ULL / (uint64_t)interval);
                                 }
 
                                 if (w && h) {
@@ -1350,6 +1409,19 @@ static HRESULT build_capture_graph_rgb32(
     hr = cfg->GetStreamCaps((int)streamCapsIndex, &mt, capsBuf.data());
     if (FAILED(hr) || !mt) { SAFE_RELEASE(cfg); return E_FAIL; }
 
+    // GetStreamCaps can return a conservative default AvgTimePerFrame even
+    // when the capability advertises a faster valid interval. Always request
+    // the fastest rate for the explicitly selected capability.
+    auto selectedCaps = (VIDEO_STREAM_CONFIG_CAPS*)capsBuf.data();
+    if (selectedCaps->MinFrameInterval > 0) {
+        if (set_media_type_frame_interval(mt, selectedCaps->MinFrameInterval)) {
+            dbg_printf(
+                "Requesting fastest frame interval: %lld (%.3f fps)\n",
+                (long long)selectedCaps->MinFrameInterval,
+                10000000.0 / (double)selectedCaps->MinFrameInterval);
+        }
+    }
+
     hr = cfg->SetFormat(mt);
     if (FAILED(hr)) {
         free_am_media_type(mt);
@@ -1357,13 +1429,10 @@ static HRESULT build_capture_graph_rgb32(
         return hr;
     }
 
-    if (mt->formattype == FORMAT_VideoInfo && mt->pbFormat) {
-        auto vih = (VIDEOINFOHEADER*)mt->pbFormat;
-        if (!try_get_vih_dimensions(vih, s->width, s->height)) {
-            free_am_media_type(mt);
-            SAFE_RELEASE(cfg);
-            return E_FAIL;
-        }
+    if (!try_get_media_type_dimensions(mt, s->width, s->height)) {
+        free_am_media_type(mt);
+        SAFE_RELEASE(cfg);
+        return E_FAIL;
     }
 
     free_am_media_type(mt);
@@ -1435,6 +1504,14 @@ static HRESULT build_capture_graph_rgb32(
     {
         AM_MEDIA_TYPE connected{};
         if (SUCCEEDED(s->grabber->GetConnectedMediaType(&connected))) {
+            REFERENCE_TIME connectedInterval = media_type_frame_interval(&connected);
+            if (connectedInterval > 0) {
+                dbg_printf(
+                    "Connected RGB32 frame interval: %lld (%.3f fps)\n",
+                    (long long)connectedInterval,
+                    10000000.0 / (double)connectedInterval);
+            }
+
             LONG ch = 0;
             bool haveH = false;
             if (connected.formattype == FORMAT_VideoInfo &&
@@ -1787,7 +1864,7 @@ extern "C" {
     }
 
     SP_API cds_result_t SP_CALL cds_start_capture(uint32_t device_index, uint32_t width, uint32_t height) {
-        uint32_t bestFormatIndex = UINT32_MAX;
+        std::vector<uint32_t> rankedFormatIndices;
         {
             std::lock_guard<std::mutex> lk(g_dsMutex);
             if (!g_dsInitialized) return CDS_ERR_NOT_INITIALIZED;
@@ -1796,30 +1873,59 @@ extern "C" {
 
             auto& fmts = g_dsDevices[device_index].formats;
 
-            auto prio = [](const GUID& st)->int {
-                if (st == MEDIASUBTYPE_RGB24 || st == MEDIASUBTYPE_RGB32) return 4;
-                if (st == MEDIASUBTYPE_NV12) return 3;
-                if (st == MEDIASUBTYPE_YUY2) return 2;
-                if (st == MEDIASUBTYPE_MJPG) return 1;
-                return 0;
-            };
-
-            int best = -1;
-            int bestP = -1;
-            uint32_t bestFps = 0;
-
             for (int i = 0; i < (int)fmts.size(); ++i) {
                 if (fmts[i].width != width || fmts[i].height != height) continue;
-                int p = prio(fmts[i].subtype);
-                if (p > bestP || (p == bestP && fmts[i].maxFps > bestFps)) {
-                    best = i; bestP = p; bestFps = fmts[i].maxFps;
-                }
+                rankedFormatIndices.push_back((uint32_t)i);
             }
 
-            if (best < 0) return CDS_ERR_FORMAT_NOT_FOUND;
-            bestFormatIndex = (uint32_t)best;
+            if (rankedFormatIndices.empty()) return CDS_ERR_FORMAT_NOT_FOUND;
+            std::stable_sort(
+                rankedFormatIndices.begin(),
+                rankedFormatIndices.end(),
+                [&](uint32_t a, uint32_t b) {
+                    return cds_format_selection::IsBetter(
+                        cds_format_selection::Score(
+                            fmts[(size_t)a].maxFps,
+                            SubTypeProcessingRank(fmts[(size_t)a].subtype),
+                            a),
+                        cds_format_selection::Score(
+                            fmts[(size_t)b].maxFps,
+                            SubTypeProcessingRank(fmts[(size_t)b].subtype),
+                            b));
+                });
+
+            for (size_t rank = 0; rank < rankedFormatIndices.size(); ++rank) {
+                uint32_t index = rankedFormatIndices[rank];
+                const char* subtype = SubTypeName(fmts[(size_t)index].subtype);
+                dbg_printf(
+                    "Resolution-only candidate #%zu: %ux%u index=%u fps=%u subtype=%s processing-rank=%d\n",
+                    rank + 1,
+                    width,
+                    height,
+                    index,
+                    fmts[(size_t)index].maxFps,
+                    subtype ? subtype : "OTHER",
+                    SubTypeProcessingRank(fmts[(size_t)index].subtype));
+            }
         }
-        return cds_start_capture_with_format(device_index, bestFormatIndex);
+
+        cds_result_t lastResult = CDS_ERR_OPENING_DEVICE;
+        for (uint32_t formatIndex : rankedFormatIndices) {
+            lastResult = cds_start_capture_with_format(device_index, formatIndex);
+            if (lastResult == CDS_OK) {
+                dbg_printf(
+                    "Resolution-only selection succeeded with format index=%u\n",
+                    formatIndex);
+                return CDS_OK;
+            }
+            if (lastResult != CDS_ERR_OPENING_DEVICE) {
+                return lastResult;
+            }
+            dbg_printf(
+                "Resolution-only format index=%u could not build/run; trying next candidate\n",
+                formatIndex);
+        }
+        return lastResult;
     }
 
     SP_API cds_result_t SP_CALL cds_start_capture_with_format(uint32_t device_index, uint32_t format_index) {
