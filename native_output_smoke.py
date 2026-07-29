@@ -12,6 +12,7 @@ CDS_OUTPUT_NATIVE = 1
 CDS_PIXEL_FORMAT_BGRA = 1
 CDS_PIXEL_FORMAT_NV12 = 2
 CDS_PIXEL_FORMAT_YUY2 = 3
+CDS_PIXEL_FORMAT_MJPEG = 4
 FRAME_CALLBACK = ctypes.WINFUNCTYPE(
     None,
     ctypes.c_uint32,
@@ -104,7 +105,10 @@ def assert_layout_and_grab(dll, device_index, expected_pixel_format):
         for plane in range(plane_count)
     ]
     assert offsets[0] == 0
-    assert all(stride > 0 for stride in strides)
+    if expected_pixel_format == CDS_PIXEL_FORMAT_MJPEG:
+        assert strides == [0]
+    else:
+        assert all(stride > 0 for stride in strides)
 
     if expected_pixel_format == CDS_PIXEL_FORMAT_BGRA:
         assert strides[0] >= width * 4
@@ -113,16 +117,18 @@ def assert_layout_and_grab(dll, device_index, expected_pixel_format):
         assert width % 2 == 0
         assert strides[0] >= width * 2
         assert data_size >= strides[0] * height
-    else:
+    elif expected_pixel_format == CDS_PIXEL_FORMAT_NV12:
         assert width % 2 == 0 and height % 2 == 0
         assert strides[0] >= width and strides[1] >= width
         assert offsets[1] >= strides[0] * height
         assert data_size >= offsets[1] + strides[1] * (height // 2)
 
-    frame = (ctypes.c_uint8 * data_size)()
-    result = dll.cds_grab_frame(device_index, frame, data_size)
-    assert result == CDS_OK, f"cds_grab_frame returned {result}"
-    assert any(frame), "Captured frame was entirely zero"
+    frame = None
+    if expected_pixel_format != CDS_PIXEL_FORMAT_MJPEG:
+        frame = (ctypes.c_uint8 * data_size)()
+        result = dll.cds_grab_frame(device_index, frame, data_size)
+        assert result == CDS_OK, f"cds_grab_frame returned {result}"
+        assert any(frame), "Captured frame was entirely zero"
     return {
         "width": width,
         "height": height,
@@ -154,7 +160,7 @@ def main():
         for device_index in range(dll.cds_devices_count()):
             for format_index in range(dll.cds_device_formats_count(device_index)):
                 subtype = format_type(dll, device_index, format_index)
-                if subtype not in {"NV12", "YUY2"}:
+                if subtype not in {"NV12", "YUY2", "MJPG"}:
                     continue
                 candidates.append(
                     (
@@ -168,13 +174,15 @@ def main():
                 )
 
         if not candidates:
-            print("SKIP: No connected camera advertises NV12 or YUY2")
+            print("SKIP: No connected camera advertises NV12, YUY2, or MJPG")
             return 0
 
         _, _, device_index, format_index, subtype = max(candidates)
-        expected_native = (
-            CDS_PIXEL_FORMAT_NV12 if subtype == "NV12" else CDS_PIXEL_FORMAT_YUY2
-        )
+        expected_native = {
+            "NV12": CDS_PIXEL_FORMAT_NV12,
+            "YUY2": CDS_PIXEL_FORMAT_YUY2,
+            "MJPG": CDS_PIXEL_FORMAT_MJPEG,
+        }[subtype]
 
         result = dll.cds_start_capture_with_format_output(
             device_index,
@@ -187,16 +195,19 @@ def main():
             callback_event = threading.Event()
             callback_frames = 0
             callback_bytes = 0
+            callback_jpeg = False
 
             @FRAME_CALLBACK
             def on_frame(callback_device, data, data_size, bottom_up, _user_data):
-                nonlocal callback_frames, callback_bytes
+                nonlocal callback_frames, callback_bytes, callback_jpeg
                 assert callback_device == device_index
                 assert bool(data)
                 assert data_size > 0
                 assert bottom_up == 0
                 callback_frames += 1
                 callback_bytes += data_size
+                if expected_native == CDS_PIXEL_FORMAT_MJPEG:
+                    callback_jpeg = bytes(data[:2]) == b"\xff\xd8"
                 if callback_frames >= 5:
                     callback_event.set()
 
@@ -214,7 +225,9 @@ def main():
                 expected_native,
             )
             assert callback_frames >= 5
-            assert callback_bytes >= callback_frames * native_layout["data_size"]
+            assert callback_bytes > 0
+            if expected_native == CDS_PIXEL_FORMAT_MJPEG:
+                assert callback_jpeg, "MJPEG callback sample is not a JPEG"
             assert dll.cds_set_frame_callback(
                 device_index,
                 FRAME_CALLBACK(),

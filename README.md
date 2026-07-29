@@ -22,16 +22,16 @@ resolution-only start tries the next ranked mode at the same resolution. Call
 `cds_start_capture_with_format` when the caller needs an exact enumerated mode
 without automatic fallback.
 
-## Native NV12/YUY2 output
+## Native NV12/YUY2/MJPEG output
 
 The existing start functions remain backward-compatible and always request
-top-down RGB32/BGRA output. Consumers that can process YUV may use:
+top-down RGB32/BGRA output. Consumers that can process native frames may use:
 
 - `cds_start_capture_with_output`
 - `cds_start_capture_with_format_output`
 
-Pass `CDS_OUTPUT_NATIVE` to preserve an advertised NV12 or YUY2 camera mode
-without requesting DirectShow color conversion. Other native subtypes return
+Pass `CDS_OUTPUT_NATIVE` to preserve an advertised NV12, YUY2, or MJPG camera
+mode without requesting DirectShow color conversion. Other native subtypes return
 `CDS_ERR_FORMAT_NOT_SUPPORTED`; callers can retry the same mode with
 `CDS_OUTPUT_BGRA`.
 
@@ -44,11 +44,13 @@ After a successful start, inspect the actual connected frame contract with:
 - `cds_frame_plane_bytes_per_row`
 
 NV12 is exposed as a Y plane followed by an interleaved UV plane. YUY2 is one
-packed `Y0 U Y1 V` plane. `cds_grab_frame` copies exactly
-`cds_frame_data_size` bytes.
+packed `Y0 U Y1 V` plane. MJPEG is one variable-sized compressed JPEG
+bitstream with a zero row stride. In callback mode, `data_size` is the exact
+sample size; after a frame arrives, `cds_frame_data_size()` reports that latest
+size. The bytes are neither decoded nor re-encoded by this library.
 
 Run `python native_output_smoke.py` with a connected camera to verify direct
-YUV capture and the BGRA fallback on the same enumerated mode.
+YUV/MJPEG capture and the BGRA fallback on the same enumerated mode.
 
 ## Push delivery without the continuous pull copy
 

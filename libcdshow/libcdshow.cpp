@@ -145,6 +145,9 @@ static int PixelFormatFromSubtype(const GUID& subtype) {
     if (subtype == MEDIASUBTYPE_YUY2) {
         return CDS_PIXEL_FORMAT_YUY2;
     }
+    if (subtype == MEDIASUBTYPE_MJPG) {
+        return CDS_PIXEL_FORMAT_MJPEG;
+    }
     return CDS_PIXEL_FORMAT_UNKNOWN;
 }
 
@@ -156,6 +159,8 @@ static const char* PixelFormatName(int pixelFormat) {
         return "NV12";
     case CDS_PIXEL_FORMAT_YUY2:
         return "YUY2";
+    case CDS_PIXEL_FORMAT_MJPEG:
+        return "MJPEG";
     default:
         return "UNKNOWN";
     }
@@ -847,6 +852,14 @@ static bool calc_connected_frame_layout(
         return true;
     }
 
+    if (layout.pixelFormat == CDS_PIXEL_FORMAT_MJPEG) {
+        layout.dataBytes = advertisedBytes;
+        layout.planeCount = 1;
+        // Compressed frames do not have a meaningful row stride.
+        layout.planeStrides[0] = 0;
+        return true;
+    }
+
     return false;
 }
 
@@ -883,6 +896,14 @@ static bool update_native_layout_from_sample_length(
         layout.planeStrides[0] = stride;
         layout.planeStrides[1] = stride;
         return true;
+    }
+
+    if (layout.pixelFormat == CDS_PIXEL_FORMAT_MJPEG) {
+        layout.dataBytes = sampleBytes;
+        layout.planeCount = 1;
+        layout.planeOffsets[0] = 0;
+        layout.planeStrides[0] = 0;
+        return sampleBytes > 0;
     }
 
     return sampleBytes >= layout.dataBytes;
@@ -1469,7 +1490,7 @@ static HRESULT build_still_fallback_button_branch(DsSession* s) {
     return S_OK;
 }
 
-// ---- Build capture graph: BGRA compatibility output or direct native YUV ----
+// ---- Build capture graph: BGRA compatibility output or direct native frames ----
 static HRESULT build_capture_graph(
     DsSession* s,
     const DsDevice& dev,
@@ -1624,7 +1645,8 @@ static HRESULT build_capture_graph(
     const GUID selectedSubtype = mt->subtype;
     if (outputMode == CDS_OUTPUT_NATIVE &&
         selectedSubtype != MEDIASUBTYPE_NV12 &&
-        selectedSubtype != MEDIASUBTYPE_YUY2) {
+        selectedSubtype != MEDIASUBTYPE_YUY2 &&
+        selectedSubtype != MEDIASUBTYPE_MJPG) {
         free_am_media_type(mt);
         SAFE_RELEASE(cfg);
         return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
@@ -2243,7 +2265,9 @@ extern "C" {
             devCopy = g_dsDevices[device_index];
             if (output_mode == CDS_OUTPUT_NATIVE) {
                 const GUID& subtype = g_dsDevices[device_index].formats[format_index].subtype;
-                if (subtype != MEDIASUBTYPE_NV12 && subtype != MEDIASUBTYPE_YUY2) {
+                if (subtype != MEDIASUBTYPE_NV12 &&
+                    subtype != MEDIASUBTYPE_YUY2 &&
+                    subtype != MEDIASUBTYPE_MJPG) {
                     return CDS_ERR_FORMAT_NOT_SUPPORTED;
                 }
             }
@@ -2344,7 +2368,7 @@ extern "C" {
         }
 
         std::unique_lock<std::mutex> lk2(s->frameMutex);
-        const size_t needed = s->frameLayout.dataBytes;
+        size_t needed = s->frameLayout.dataBytes;
         if (needed == 0 || available_bytes < needed) return CDS_ERR_BUF_TOO_SMALL;
 
         if (callbackExclusive) {
@@ -2359,6 +2383,12 @@ extern "C" {
                 });
             if (!received || s->pullFrameSequence <= previousSequence) {
                 return CDS_ERR_READ_FRAME;
+            }
+            // MJPEG samples are variable-sized. Re-read the size after the
+            // requested sample arrives so we never silently truncate it.
+            needed = s->frameLayout.dataBytes;
+            if (needed == 0 || available_bytes < needed) {
+                return CDS_ERR_BUF_TOO_SMALL;
             }
         }
 

@@ -44,14 +44,16 @@ extern "C" {
 #define CDS_PIXEL_FORMAT_BGRA    1
 #define CDS_PIXEL_FORMAT_NV12    2
 #define CDS_PIXEL_FORMAT_YUY2    3
+#define CDS_PIXEL_FORMAT_MJPEG   4
 
 	// Optional push delivery. The frame pointer is owned by DirectShow and is
 	// valid only for the duration of the callback. The callback must copy or
 	// consume it immediately and must not call stop/shutdown functions.
 	//
-	// bottom_up is non-zero only for bottom-up RGB frames. Native NV12/YUY2 is
-	// delivered top-down. When exclusive is non-zero, the callback replaces
-	// the continuous internal pull-frame copy until it is unregistered.
+	// bottom_up is non-zero only for bottom-up RGB frames. Native NV12/YUY2 and
+	// compressed MJPEG are delivered without orientation changes. When
+	// exclusive is non-zero, the callback replaces the continuous internal
+	// pull-frame copy until it is unregistered.
 	// cds_grab_frame() remains available and waits for the next frame, retaining
 	// a pull copy only for that explicit request.
 	typedef void (SP_CALL *cds_frame_callback_t)(
@@ -120,9 +122,11 @@ extern "C" {
 	SP_API cds_result_t SP_CALL cds_start_capture(uint32_t device_index, uint32_t width, uint32_t height);
 	SP_API cds_result_t SP_CALL cds_start_capture_with_format(uint32_t device_index, uint32_t format_index);
 
-	// Output-mode variants. CDS_OUTPUT_NATIVE currently accepts only an exact
-	// native NV12 or YUY2 camera capability and does not insert an application
-	// color conversion. Use the frame layout functions below after start.
+	// Output-mode variants. CDS_OUTPUT_NATIVE accepts an exact native NV12,
+	// YUY2, or MJPEG camera capability and does not insert an application color
+	// conversion. MJPEG frames are variable-sized compressed JPEG bitstreams;
+	// their stride is zero and cds_frame_data_size() reports the latest sample
+	// size. Use the frame layout functions below after start.
 	// Unsupported native subtypes return CDS_ERR_FORMAT_NOT_SUPPORTED so callers
 	// can retry the same mode with CDS_OUTPUT_BGRA.
 	SP_API cds_result_t SP_CALL cds_start_capture_with_output(
